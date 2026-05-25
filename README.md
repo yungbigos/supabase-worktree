@@ -10,7 +10,15 @@ Originally built to let multiple feature branches of the same project run their 
 brew install yannikw23/tap/supabase-worktree
 ```
 
-Requires the Supabase CLI (`brew install supabase/tap/supabase`), Docker, and a `libpq` install (provides `psql` / `pg_restore`).
+Requires Docker and the Supabase CLI. The CLI is available from two taps — either works:
+
+```sh
+brew install supabase          # homebrew/core
+# or
+brew install supabase/tap/supabase
+```
+
+(The formula does **not** declare a dependency on `supabase` because the two taps conflict; install it yourself before using this tool.) `libpq` is pulled in automatically for `psql` / `pg_restore`.
 
 ## Quickstart
 
