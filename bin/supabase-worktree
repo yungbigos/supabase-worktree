@@ -1,0 +1,253 @@
+#!/usr/bin/env bash
+#
+# supabase-worktree — spin up an isolated Supabase stack per project or git worktree.
+#
+# Each instance gets a deterministic port offset derived from its name, a unique
+# `project_id`, and symlinks back to the source `supabase/` directory so
+# migrations / seeds / schemas / functions / templates / tests all just work.
+#
+# The instance name is chosen in this order of precedence:
+#   1. $SUPABASE_WORKTREE_NAME           (explicit override)
+#   2. git worktree branch (when inside a git work tree, slugified)
+#   3. a deterministic keyword derived from sha1(ROOT)   (plain-directory mode)
+#
+# Subcommands: init | up | down | restore <dump> | psql [args] | status | version | help
+#
+set -euo pipefail
+
+VERSION="0.1.0"
+
+# --- locate ROOT (the directory containing supabase/) ------------------------
+
+ROOT=""
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  ROOT="$(git rev-parse --show-toplevel)"
+else
+  # Walk up from $PWD looking for a supabase/ directory.
+  dir="$PWD"
+  while [[ "$dir" != "/" ]]; do
+    if [[ -d "$dir/supabase" ]]; then
+      ROOT="$dir"
+      break
+    fi
+    dir="$(dirname "$dir")"
+  done
+fi
+
+if [[ -z "$ROOT" || ! -d "$ROOT/supabase" ]]; then
+  echo "supabase-worktree: no supabase/ directory found in this tree" >&2
+  echo "  (run inside a project that has a supabase/ folder, or set SUPABASE_WORKTREE_NAME to bypass)" >&2
+  exit 1
+fi
+
+cd "$ROOT"
+
+# --- derive instance NAME ----------------------------------------------------
+
+KEYWORDS=(
+  swift lively brisk bold calm eager fancy gentle happy jolly keen lucky
+  merry nimble proud quiet rapid silver tidy upbeat vivid witty zen amber
+  azure crimson dusky ember flax frost glow hazel indigo ivory jade kale
+  lilac maple navy ochre opal pearl plum rose ruby sage scarlet sienna
+  slate sunny teal topaz umber violet wheat willow zephyr ash bay clay
+  dew fern fjord glade gold haze
+)
+
+derive_keyword() {
+  local seed="$1"
+  local hash idx
+  hash="$(printf '%s' "$seed" | shasum -a 1 | awk '{print $1}')"
+  idx=$((0x${hash:0:6} % ${#KEYWORDS[@]}))
+  printf '%s' "${KEYWORDS[$idx]}"
+}
+
+slugify() {
+  printf '%s' "$1" | tr '/' '-' | tr '[:upper:]' '[:lower:]'
+}
+
+WORKTREE_NAME="${SUPABASE_WORKTREE_NAME:-}"
+if [[ -z "$WORKTREE_NAME" ]]; then
+  # Try git worktree branch first
+  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    branch="$(git -C "$ROOT" symbolic-ref --short -q HEAD || true)"
+    if [[ -n "$branch" ]]; then
+      WORKTREE_NAME="$(slugify "$branch")"
+    fi
+  fi
+fi
+if [[ -z "$WORKTREE_NAME" ]]; then
+  WORKTREE_NAME="$(derive_keyword "$ROOT")"
+fi
+
+# --- derive base project_id from supabase/config.toml ------------------------
+
+SOURCE_CONFIG="$ROOT/supabase/config.toml"
+if [[ ! -f "$SOURCE_CONFIG" ]]; then
+  echo "supabase-worktree: $SOURCE_CONFIG not found" >&2
+  exit 1
+fi
+
+BASE_PROJECT_ID="${SUPABASE_WORKTREE_PROJECT_ID:-}"
+if [[ -z "$BASE_PROJECT_ID" ]]; then
+  BASE_PROJECT_ID="$(awk -F'"' '/^[[:space:]]*project_id[[:space:]]*=/ {print $2; exit}' "$SOURCE_CONFIG")"
+fi
+if [[ -z "$BASE_PROJECT_ID" ]]; then
+  BASE_PROJECT_ID="$(basename "$ROOT")"
+fi
+
+PROJECT_ID="${BASE_PROJECT_ID}-${WORKTREE_NAME}"
+
+# --- derive port offset ------------------------------------------------------
+
+if [[ -n "${SUPABASE_WORKTREE_PORT_OFFSET:-}" ]]; then
+  OFFSET="$SUPABASE_WORKTREE_PORT_OFFSET"
+else
+  HASH="$(printf '%s' "$WORKTREE_NAME" | shasum -a 1 | awk '{print $1}')"
+  OFFSET_RAW=$((0x${HASH:0:6} % 50))
+  OFFSET=$((OFFSET_RAW * 100))
+fi
+
+WT_API=$((54321 + OFFSET))
+WT_DB=$((54322 + OFFSET))
+WT_STUDIO=$((54323 + OFFSET))
+WT_INBUCKET=$((54324 + OFFSET))
+WT_ANALYTICS=$((54327 + OFFSET))
+WT_POOLER=$((54329 + OFFSET))
+WT_SHADOW=$((54330 + OFFSET))
+WT_INSPECTOR=$((8083 + OFFSET))
+
+WT_DIR="${ROOT}/.supabase-worktree"
+WT_SB_DIR="${WT_DIR}/supabase"
+WT_CONFIG="${WT_SB_DIR}/config.toml"
+DB_URL="postgresql://postgres:postgres@127.0.0.1:${WT_DB}/postgres"
+
+# --- subcommands -------------------------------------------------------------
+
+cmd_init() {
+  mkdir -p "$WT_SB_DIR"
+
+  for d in migrations functions schemas seeds tests templates; do
+    src="${ROOT}/supabase/$d"
+    dst="${WT_SB_DIR}/$d"
+    if [[ -e "$src" && ! -e "$dst" ]]; then
+      ln -s "../../supabase/$d" "$dst"
+    fi
+  done
+
+  if [[ -f "$WT_CONFIG" ]]; then
+    echo "supabase-worktree: config already present at $WT_CONFIG"
+    return 0
+  fi
+
+  sed \
+    -e "s|^project_id = \"${BASE_PROJECT_ID}\"|project_id = \"${PROJECT_ID}\"|" \
+    -e "s|port = 54321|port = ${WT_API}|" \
+    -e "s|port = 54322|port = ${WT_DB}|" \
+    -e "s|shadow_port = 54330|shadow_port = ${WT_SHADOW}|" \
+    -e "s|port = 54329|port = ${WT_POOLER}|" \
+    -e "s|port = 54323|port = ${WT_STUDIO}|" \
+    -e "s|port = 54324|port = ${WT_INBUCKET}|" \
+    -e "s|port = 54327|port = ${WT_ANALYTICS}|" \
+    -e "s|inspector_port = 8083|inspector_port = ${WT_INSPECTOR}|" \
+    -e "s|127.0.0.1:54321|127.0.0.1:${WT_API}|g" \
+    "$SOURCE_CONFIG" > "$WT_CONFIG"
+
+  echo "supabase-worktree: wrote ${WT_CONFIG}"
+  echo "  project_id: ${PROJECT_ID}"
+  printf "  ports: api=%d db=%d studio=%d inbucket=%d analytics=%d pooler=%d shadow=%d inspector=%d\n" \
+    "$WT_API" "$WT_DB" "$WT_STUDIO" "$WT_INBUCKET" "$WT_ANALYTICS" "$WT_POOLER" "$WT_SHADOW" "$WT_INSPECTOR"
+}
+
+cmd_up() {
+  cmd_init
+  supabase --workdir "$WT_DIR" start "$@"
+}
+
+cmd_down() {
+  supabase --workdir "$WT_DIR" stop "$@"
+}
+
+cmd_status() {
+  echo "root       : ${ROOT}"
+  echo "name       : ${WORKTREE_NAME}"
+  echo "project_id : ${PROJECT_ID}"
+  echo "config     : ${WT_CONFIG}"
+  printf "ports      : api=%d db=%d studio=%d inbucket=%d analytics=%d pooler=%d shadow=%d inspector=%d\n" \
+    "$WT_API" "$WT_DB" "$WT_STUDIO" "$WT_INBUCKET" "$WT_ANALYTICS" "$WT_POOLER" "$WT_SHADOW" "$WT_INSPECTOR"
+  echo "db url     : ${DB_URL}"
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "supabase_db_${PROJECT_ID}"; then
+    echo "status     : RUNNING"
+  else
+    echo "status     : stopped"
+  fi
+}
+
+cmd_restore() {
+  if [[ $# -lt 1 ]]; then
+    echo "Usage: $0 restore <dump-file>" >&2
+    exit 2
+  fi
+  local dump="$1"
+  if [[ ! -f "$dump" ]]; then
+    echo "supabase-worktree: dump not found: $dump" >&2
+    exit 1
+  fi
+  echo "supabase-worktree: restoring $dump into ${PROJECT_ID} (port ${WT_DB})"
+  pg_restore --clean --if-exists --no-owner --no-privileges \
+    --dbname "$DB_URL" \
+    "$dump"
+}
+
+cmd_psql() {
+  exec psql "$DB_URL" "$@"
+}
+
+cmd_version() {
+  echo "supabase-worktree ${VERSION}"
+}
+
+cmd_help() {
+  cat <<EOF
+supabase-worktree ${VERSION}
+
+Usage: $(basename "$0") <command> [args...]
+
+Commands:
+  init                  Generate .supabase-worktree/supabase/config.toml + symlinks
+  up [supabase args]    supabase start in the isolated stack
+  down [supabase args]  supabase stop in the isolated stack
+  status                Show root, project_id, ports, db url, running state
+  restore <dump-file>   pg_restore the dump into the isolated DB
+  psql [args...]        psql into the isolated DB
+  version               Print the installed version
+  help                  Show this message
+
+Env overrides:
+  SUPABASE_WORKTREE_NAME         override the derived instance name
+  SUPABASE_WORKTREE_PROJECT_ID   override the auto-detected base project_id
+  SUPABASE_WORKTREE_PORT_OFFSET  pin the port offset
+
+Resolved for this invocation:
+  root         : ${ROOT}
+  name         : ${WORKTREE_NAME}
+  base project : ${BASE_PROJECT_ID}
+  project_id   : ${PROJECT_ID}
+  db url       : ${DB_URL}
+EOF
+}
+
+# --- dispatch ----------------------------------------------------------------
+
+cmd="${1:-help}"
+shift || true
+case "$cmd" in
+  init)            cmd_init    "$@" ;;
+  up)              cmd_up      "$@" ;;
+  down)            cmd_down    "$@" ;;
+  status)          cmd_status  "$@" ;;
+  restore)         cmd_restore "$@" ;;
+  psql)            cmd_psql    "$@" ;;
+  version|--version|-v) cmd_version ;;
+  help|-h|--help)  cmd_help ;;
+  *) echo "supabase-worktree: unknown command '$cmd'" >&2; cmd_help; exit 2 ;;
+esac

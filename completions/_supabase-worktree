@@ -1,0 +1,26 @@
+#compdef supabase-worktree
+
+_supabase_worktree() {
+  local -a commands
+  commands=(
+    'init:Generate .supabase-worktree/supabase/config.toml + symlinks'
+    'up:supabase start in the isolated stack'
+    'down:supabase stop in the isolated stack'
+    'status:Show root, project_id, ports, db url, running state'
+    'restore:pg_restore a dump into the isolated DB'
+    'psql:psql into the isolated DB'
+    'version:Print the installed version'
+    'help:Show usage'
+  )
+
+  if (( CURRENT == 2 )); then
+    _describe -t commands 'supabase-worktree command' commands
+    return
+  fi
+
+  case "${words[2]}" in
+    restore) _files ;;
+  esac
+}
+
+_supabase_worktree "$@"
