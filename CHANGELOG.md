@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.2.2 — 2026-06-02
+
+- `$ROOT/.env.local` is now a merged file — a snapshot of `$ROOT/.env` with the supabase-worktree-managed keys stripped, followed by the per-instance overrides. Previously it contained only the overrides, so Next / Bun / scripts that auto-load `.env.local` lost access to the repo `.env` (Langdock keys, OAuth secrets, etc.) when running against a worktree.
+- `.env.local` is regenerated on every `init` / `up` (the previous "don't clobber" guard is gone) so repo `.env` edits propagate. If you had local edits in `.env.local`, move them to `$ROOT/.env`.
+- `cmd_up` now refreshes both `$WT_ENV` and `$ROOT/.env.local`.
+- The override key list is factored into one `OVERRIDE_KEYS` array so the two emitters and the snapshot filter can't drift apart.
+- Added `NEXT_PUBLIC_APP_URL` to the override set so OAuth callbacks built from this env var land on the worktree port. For this to actually route through Supabase auth, the project's `supabase/config.toml` should set `site_url = "env(SITE_URL)"`. (Remember to register the worktree port in your OAuth provider consoles — Google, Webex, etc. — otherwise providers will reject the new redirect URI.)
+- `SITE_URL` (and the new `NEXT_PUBLIC_APP_URL`) now use `localhost` instead of `127.0.0.1` to match what OAuth providers typically have registered. `SUPABASE_URL` still uses `127.0.0.1` since that's how the app talks to the API container.
+- Same symlink-loop guard from v0.2.1 now also applied to `.env.local`.
+
+## v0.2.1 — 2026-06-02
+
+- Fix: `write_wt_env` no longer destroys `$ROOT/.env` when `.supabase-worktree/.env` is (or has become) a symlink back to it. Previously, `{ cat $ROOT/.env; ... } > $WT_ENV` could self-concatenate the source file under racy conditions, producing multi-GB env files. The function now (1) detects the dangerous symlink and removes it before writing, and (2) writes via a temp file + atomic `mv`, so the read source and the write target are always distinct inodes.
+
 ## v0.2.0 — 2026-05-29
 
 - `init` now writes `.supabase-worktree/.env` — a snapshot of the repo `.env` plus per-instance overrides (`SUPABASE_URL`, `SITE_URL`, `SUPABASE_WORKTREE_NEXT_PORT`, `SUPABASE_WORKTREE_PORT_OFFSET`, `SUPABASE_WORKTREE_NAME`). The Supabase CLI reads this for `env()` interpolation in `config.toml`, so OAuth credentials and per-worktree `site_url` resolve correctly.
