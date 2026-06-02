@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.2.3 — 2026-06-02
+
+- Emit `PORT=${WT_NEXT_PORT}` in `.env.local` and `$WT_ENV`. Bun loads `.env.local` into `process.env` and child processes inherit it, so the spawned dev server picks up the worktree port automatically. Previously, package.json scripts using `${SUPABASE_WORKTREE_NEXT_PORT:-3000}` always fell back to 3000 because bun does **not** expose `.env`-loaded vars to script subshells (the variable is in `process.env` but not in the shell scope that expands `${VAR}`). Drop the `-p` flag from your `dev`/`start` scripts and let Next read `PORT` directly.
+
 ## v0.2.2 — 2026-06-02
 
 - `$ROOT/.env.local` is now a merged file — a snapshot of `$ROOT/.env` with the supabase-worktree-managed keys stripped, followed by the per-instance overrides. Previously it contained only the overrides, so Next / Bun / scripts that auto-load `.env.local` lost access to the repo `.env` (Langdock keys, OAuth secrets, etc.) when running against a worktree.

@@ -15,7 +15,7 @@
 #
 set -euo pipefail
 
-VERSION="0.2.2"
+VERSION="0.2.3"
 
 # --- locate ROOT (the directory containing supabase/) ------------------------
 
@@ -147,6 +147,7 @@ OVERRIDE_KEYS=(
   SUPABASE_WORKTREE_NAME
   SUPABASE_WORKTREE_PORT_OFFSET
   SUPABASE_WORKTREE_NEXT_PORT
+  PORT
   SUPABASE_URL
   NEXT_PUBLIC_SUPABASE_URL
   SITE_URL
@@ -158,6 +159,11 @@ emit_overrides() {
   echo "SUPABASE_WORKTREE_NAME=${WORKTREE_NAME}"
   echo "SUPABASE_WORKTREE_PORT_OFFSET=${OFFSET}"
   echo "SUPABASE_WORKTREE_NEXT_PORT=${WT_NEXT_PORT}"
+  # PORT is what Next.js / most Node frameworks read at process start — by
+  # baking it into .env.local, bun-loaded env propagates to the spawned dev
+  # server without needing shell expansion in the package.json script (which
+  # doesn't work — bun does not expose .env-loaded vars to script subshells).
+  echo "PORT=${WT_NEXT_PORT}"
   echo "SUPABASE_URL=http://127.0.0.1:${WT_API}"
   echo "NEXT_PUBLIC_SUPABASE_URL=http://127.0.0.1:${WT_API}"
   echo "SITE_URL=${SITE_URL}"
