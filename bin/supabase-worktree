@@ -15,7 +15,7 @@
 #
 set -euo pipefail
 
-VERSION="0.3.0"
+VERSION="0.5.0"
 
 # --- locate ROOT (the directory containing supabase/) ------------------------
 
@@ -99,12 +99,40 @@ PROJECT_ID="${BASE_PROJECT_ID}-${WORKTREE_NAME}"
 
 # --- derive port offset ------------------------------------------------------
 
+# Reservable port-offset slots. A worktree's offset is picked deterministically
+# from this list: OFFSETS[sha1(name) % len(OFFSETS)]. The whole point of
+# enumerating slots (vs. the old `sha1 % 50 * 100` formula) is that every
+# possible derived port is known up-front, so OAuth providers (Google, etc.)
+# can be whitelisted ONCE with the full set of redirect URIs and never need
+# touching when a new worktree is created.
+#
+# The default list is the same 50 slots (multiples of 100, 0..4900) the old
+# formula generated, so existing worktrees keep their offset across upgrade.
+# Override the entire list with $SUPABASE_WORKTREE_OFFSETS (comma-separated).
+# Pin a specific slot with $SUPABASE_WORKTREE_PORT_OFFSET (skips derivation).
+OFFSETS=(
+  0    100  200  300  400  500  600  700  800  900
+  1000 1100 1200 1300 1400 1500 1600 1700 1800 1900
+  2000 2100 2200 2300 2400 2500 2600 2700 2800 2900
+  3000 3100 3200 3300 3400 3500 3600 3700 3800 3900
+  4000 4100 4200 4300 4400 4500 4600 4700 4800 4900
+)
+
+if [[ -n "${SUPABASE_WORKTREE_OFFSETS:-}" ]]; then
+  IFS=',' read -r -a OFFSETS <<<"$SUPABASE_WORKTREE_OFFSETS"
+fi
+
+if [[ ${#OFFSETS[@]} -eq 0 ]]; then
+  echo "supabase-worktree: OFFSETS list is empty (check \$SUPABASE_WORKTREE_OFFSETS)" >&2
+  exit 1
+fi
+
 if [[ -n "${SUPABASE_WORKTREE_PORT_OFFSET:-}" ]]; then
   OFFSET="$SUPABASE_WORKTREE_PORT_OFFSET"
 else
   HASH="$(printf '%s' "$WORKTREE_NAME" | shasum -a 1 | awk '{print $1}')"
-  OFFSET_RAW=$((0x${HASH:0:6} % 50))
-  OFFSET=$((OFFSET_RAW * 100))
+  SLOT=$((0x${HASH:0:6} % ${#OFFSETS[@]}))
+  OFFSET="${OFFSETS[$SLOT]}"
 fi
 
 WT_API=$((54321 + OFFSET))
@@ -121,6 +149,11 @@ WT_SB_DIR="${WT_DIR}/supabase"
 WT_CONFIG="${WT_SB_DIR}/config.toml"
 WT_ENV="${WT_DIR}/.env"
 ROOT_ENV_LOCAL="${ROOT}/.env.local"
+# Optional user-supplied script run after init/up wires up env + config. Lives
+# at the repo root so it survives `.supabase-worktree/` regeneration and gets
+# committed alongside the project (unlike anything inside .supabase-worktree/).
+# See `run_post_init_hook` for the env it receives.
+HOOK_FILE="${ROOT}/.supabase-worktree.hook"
 DB_URL="postgresql://postgres:postgres@127.0.0.1:${WT_DB}/postgres"
 
 # Derived Next.js / app dev-server port — same offset bucket as Supabase, so
@@ -240,6 +273,43 @@ EOF
   echo "supabase-worktree: wrote ${ROOT_ENV_LOCAL}"
 }
 
+# run_post_init_hook — if $ROOT/.supabase-worktree.hook is present and
+# executable, run it after env files + config.toml have been (re)generated.
+# Exports the resolved instance state so the hook can copy extra files
+# (e.g. .env.local from the main checkout into a new worktree), seed local
+# data, or kick off any project-specific bootstrap.
+#
+# Fired on every `init` / `up` so re-running propagates repo edits, matching
+# the env writers above. Hooks should therefore be idempotent.
+run_post_init_hook() {
+  if [[ ! -f "$HOOK_FILE" ]]; then
+    return 0
+  fi
+  if [[ ! -x "$HOOK_FILE" ]]; then
+    echo "supabase-worktree: ${HOOK_FILE} is not executable — skipping (chmod +x to enable)" >&2
+    return 0
+  fi
+  echo "supabase-worktree: running hook ${HOOK_FILE}"
+  SUPABASE_WORKTREE_ROOT="$ROOT" \
+  SUPABASE_WORKTREE_NAME="$WORKTREE_NAME" \
+  SUPABASE_WORKTREE_PROJECT_ID="$PROJECT_ID" \
+  SUPABASE_WORKTREE_BASE_PROJECT_ID="$BASE_PROJECT_ID" \
+  SUPABASE_WORKTREE_PORT_OFFSET="$OFFSET" \
+  SUPABASE_WORKTREE_DIR="$WT_DIR" \
+  SUPABASE_WORKTREE_API_PORT="$WT_API" \
+  SUPABASE_WORKTREE_DB_PORT="$WT_DB" \
+  SUPABASE_WORKTREE_STUDIO_PORT="$WT_STUDIO" \
+  SUPABASE_WORKTREE_INBUCKET_PORT="$WT_INBUCKET" \
+  SUPABASE_WORKTREE_ANALYTICS_PORT="$WT_ANALYTICS" \
+  SUPABASE_WORKTREE_POOLER_PORT="$WT_POOLER" \
+  SUPABASE_WORKTREE_SHADOW_PORT="$WT_SHADOW" \
+  SUPABASE_WORKTREE_INSPECTOR_PORT="$WT_INSPECTOR" \
+  SUPABASE_WORKTREE_NEXT_PORT="$WT_NEXT_PORT" \
+  SUPABASE_WORKTREE_SITE_URL="$SITE_URL" \
+  SUPABASE_WORKTREE_DB_URL="$DB_URL" \
+    "$HOOK_FILE"
+}
+
 # --- subcommands -------------------------------------------------------------
 
 cmd_init() {
@@ -258,6 +328,7 @@ cmd_init() {
 
   if [[ -f "$WT_CONFIG" ]]; then
     echo "supabase-worktree: config already present at $WT_CONFIG"
+    run_post_init_hook
     return 0
   fi
 
@@ -278,6 +349,8 @@ cmd_init() {
   echo "  project_id: ${PROJECT_ID}"
   printf "  ports: api=%d db=%d studio=%d inbucket=%d analytics=%d pooler=%d shadow=%d inspector=%d\n" \
     "$WT_API" "$WT_DB" "$WT_STUDIO" "$WT_INBUCKET" "$WT_ANALYTICS" "$WT_POOLER" "$WT_SHADOW" "$WT_INSPECTOR"
+
+  run_post_init_hook
 }
 
 cmd_up() {
@@ -287,6 +360,76 @@ cmd_up() {
   write_wt_env
   write_root_env_local
   supabase --workdir "$WT_DIR" start "$@"
+}
+
+cmd_ports() {
+  # Enumerate every reservable port slot derived from $OFFSETS — the full set
+  # of redirect URIs to whitelist in OAuth providers once, so new worktrees
+  # never need a console roundtrip.
+  local mode="urls"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --urls|--oauth) mode="urls"; shift ;;
+      --table)        mode="table"; shift ;;
+      --all)          mode="all"; shift ;;
+      -h|--help)
+        cat <<'EOF'
+Usage: supabase-worktree ports [--urls | --table | --all]
+
+  --urls   (default) Print one Supabase auth redirect URI per slot, ready
+           to paste into Google / GitHub / etc. OAuth allowed-URIs lists.
+  --table  Print a per-slot table (offset, api, db, studio, inbucket, next).
+  --all    Print both the table and the URIs.
+EOF
+        return 0
+        ;;
+      *) echo "supabase-worktree ports: unknown flag: $1" >&2; return 64 ;;
+    esac
+  done
+
+  if [[ "$mode" == "table" || "$mode" == "all" ]]; then
+    printf "%-7s %-6s %-6s %-6s %-8s %-9s %-7s %-7s %-9s %-5s\n" \
+      OFFSET API DB STUDIO INBUCKET ANALYTICS POOLER SHADOW INSPECTOR NEXT
+    local off api db studio inbucket analytics pooler shadow inspector next
+    for off in "${OFFSETS[@]}"; do
+      api=$((54321 + off))
+      db=$((54322 + off))
+      studio=$((54323 + off))
+      inbucket=$((54324 + off))
+      analytics=$((54327 + off))
+      pooler=$((54329 + off))
+      shadow=$((54330 + off))
+      inspector=$((8083 + off))
+      next=$((3000 + off / 100))
+      printf "%-7d %-6d %-6d %-6d %-8d %-9d %-7d %-7d %-9d %-5d\n" \
+        "$off" "$api" "$db" "$studio" "$inbucket" "$analytics" "$pooler" "$shadow" "$inspector" "$next"
+    done
+  fi
+
+  if [[ "$mode" == "all" ]]; then
+    echo
+  fi
+
+  if [[ "$mode" == "urls" || "$mode" == "all" ]]; then
+    local off api
+    for off in "${OFFSETS[@]}"; do
+      api=$((54321 + off))
+      echo "http://127.0.0.1:${api}/auth/v1/callback"
+    done
+  fi
+}
+
+cmd_hook() {
+  if [[ ! -f "$HOOK_FILE" ]]; then
+    echo "supabase-worktree: no hook at ${HOOK_FILE}" >&2
+    return 1
+  fi
+  if [[ ! -x "$HOOK_FILE" ]]; then
+    echo "supabase-worktree: ${HOOK_FILE} exists but is not executable" >&2
+    echo "                   chmod +x ${HOOK_FILE}" >&2
+    return 1
+  fi
+  run_post_init_hook
 }
 
 cmd_down() {
@@ -299,6 +442,13 @@ cmd_status() {
   echo "project_id : ${PROJECT_ID}"
   echo "config     : ${WT_CONFIG}"
   echo "env file   : ${WT_ENV}"
+  if [[ -f "$HOOK_FILE" ]]; then
+    if [[ -x "$HOOK_FILE" ]]; then
+      echo "hook       : ${HOOK_FILE}"
+    else
+      echo "hook       : ${HOOK_FILE} (not executable — chmod +x to enable)"
+    fi
+  fi
   printf "ports      : api=%d db=%d studio=%d inbucket=%d analytics=%d pooler=%d shadow=%d inspector=%d\n" \
     "$WT_API" "$WT_DB" "$WT_STUDIO" "$WT_INBUCKET" "$WT_ANALYTICS" "$WT_POOLER" "$WT_SHADOW" "$WT_INSPECTOR"
   echo "next port  : ${WT_NEXT_PORT}"
@@ -515,13 +665,22 @@ Commands:
   restore <dump> [-y]   Restore a custom-format pg_dump into the isolated DB
                         (two-pass: app schemas first, then auth/storage data-only)
   psql [args...]        psql into the isolated DB
+  ports [--table|--urls|--all]
+                        List every reservable port slot. Default mode prints
+                        the Supabase auth redirect URIs to paste into your
+                        OAuth provider whitelist (Google, GitHub, ...) once
+                        so new worktrees don't trigger a console roundtrip.
+  hook                  Run \$ROOT/.supabase-worktree.hook on demand (fired
+                        automatically after init/up; useful for re-running)
   version               Print the installed version
   help                  Show this message
 
 Env overrides:
   SUPABASE_WORKTREE_NAME         override the derived instance name
   SUPABASE_WORKTREE_PROJECT_ID   override the auto-detected base project_id
-  SUPABASE_WORKTREE_PORT_OFFSET  pin the port offset
+  SUPABASE_WORKTREE_PORT_OFFSET  pin a specific port offset
+  SUPABASE_WORKTREE_OFFSETS      comma-separated list of reservable offsets
+                                 (default: 50 slots, multiples of 100, 0..4900)
 
 Resolved for this invocation:
   root         : ${ROOT}
@@ -545,6 +704,8 @@ case "$cmd" in
   status)          cmd_status  "$@" ;;
   restore)         cmd_restore "$@" ;;
   psql)            cmd_psql    "$@" ;;
+  ports)           cmd_ports   "$@" ;;
+  hook)            cmd_hook    "$@" ;;
   version|--version|-v) cmd_version ;;
   help|-h|--help)  cmd_help ;;
   *) echo "supabase-worktree: unknown command '$cmd'" >&2; cmd_help; exit 2 ;;

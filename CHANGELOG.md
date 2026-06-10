@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.5.0 — 2026-06-10
+
+- Port offsets now come from an explicit list of reservable slots instead of `sha1 % 50 * 100`. The default list is the same 50 multiples of 100 (`0..4900`) the old formula produced, so existing worktrees keep their derived ports across upgrade — but every possible derived port is now enumerable up front. Whitelist all 50 redirect URIs in Google / GitHub / etc. once and you never need to touch the OAuth console again when a new worktree is created.
+- Override the full slot list with `SUPABASE_WORKTREE_OFFSETS` (comma-separated). `SUPABASE_WORKTREE_PORT_OFFSET` still pins a specific offset.
+- New `supabase-worktree ports` subcommand. Defaults to printing one Supabase auth redirect URI per slot (paste-ready for OAuth provider whitelists). `--table` prints a per-slot table of every service port; `--all` prints both.
+
+## v0.4.0 — 2026-06-10
+
+- New post-init hook. If `$ROOT/.supabase-worktree.hook` exists and is executable, it runs after `init` / `up` finishes writing `.supabase-worktree/.env`, `$ROOT/.env.local`, and `config.toml`. The hook receives the resolved instance state via env vars (`SUPABASE_WORKTREE_ROOT`, `_NAME`, `_PROJECT_ID`, `_DB_PORT`, `_API_PORT`, `_NEXT_PORT`, `_DB_URL`, `_SITE_URL`, plus every other service port). Lives at the repo root so it survives `.supabase-worktree/` regeneration and gets committed alongside the project. Typical use: copy `.env.local`-adjacent dotfiles from the main checkout into a fresh `git worktree`, seed test data, or kick off any project-specific bootstrap.
+- Fires on every `init` / `up` (matching the env writers), so hooks should be idempotent.
+- New `supabase-worktree hook` subcommand re-runs the hook on demand without re-issuing `up`.
+- `status` now reports whether a hook is present (and warns if it exists but isn't executable).
+
 ## v0.3.0 — 2026-06-10
 
 - `restore` is now a real two-pass restore instead of a single `pg_restore` call. Pass 1 restores DDL + data for app schemas while excluding `auth`, `storage`, `realtime`, `_analytics`, `_supabase`, and `supabase_functions` — those keep the local-version DDL so local GoTrue / Storage binaries stay compatible with a prod dump. Pass 2 then loads `auth` and `storage` data-only into the local-version tables. After both passes, ownership of `public.*` / `cron.*` / `supabase_migrations.*` objects is reassigned back to the `postgres` role so `supabase migration up` can ALTER them. The old single-pass behavior silently broke local sign-in.
