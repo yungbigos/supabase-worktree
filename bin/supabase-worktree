@@ -17,6 +17,18 @@ set -euo pipefail
 
 VERSION="0.5.0"
 
+# --- early dispatch for context-free subcommands -----------------------------
+# `version` / `--version` / `-v` must work without a project root so that
+# `brew test`, CI smoke checks, and ad-hoc PATH queries don't blow up. Same
+# for plain `help` — the resolved-state block in the full help requires ROOT,
+# but the usage section does not.
+case "${1:-}" in
+  version|--version|-v)
+    echo "supabase-worktree ${VERSION}"
+    exit 0
+    ;;
+esac
+
 # --- locate ROOT (the directory containing supabase/) ------------------------
 
 ROOT=""
@@ -35,6 +47,47 @@ else
 fi
 
 if [[ -z "$ROOT" || ! -d "$ROOT/supabase" ]]; then
+  # Allow `help` to run without a project context so users can discover
+  # commands from anywhere on $PATH. The full help prints a "resolved for
+  # this invocation" block; without ROOT we just print the usage section.
+  case "${1:-help}" in
+    help|-h|--help)
+      cat <<EOF
+supabase-worktree ${VERSION}
+
+Usage: $(basename "$0") <command> [args...]
+
+Commands:
+  init                  Generate .supabase-worktree/supabase/config.toml + symlinks
+  up [supabase args]    supabase start in the isolated stack
+  down [supabase args]  supabase stop in the isolated stack
+  status                Show root, project_id, ports, db url, running state
+  restore <dump> [-y]   Restore a custom-format pg_dump into the isolated DB
+                        (two-pass: app schemas first, then auth/storage data-only)
+  psql [args...]        psql into the isolated DB
+  ports [--table|--urls|--all]
+                        List every reservable port slot. Default mode prints
+                        the Supabase auth redirect URIs to paste into your
+                        OAuth provider whitelist (Google, GitHub, ...) once
+                        so new worktrees don't trigger a console roundtrip.
+  hook                  Run \$ROOT/.supabase-worktree.hook on demand (fired
+                        automatically after init/up; useful for re-running)
+  version               Print the installed version
+  help                  Show this message
+
+Env overrides:
+  SUPABASE_WORKTREE_NAME         override the derived instance name
+  SUPABASE_WORKTREE_PROJECT_ID   override the auto-detected base project_id
+  SUPABASE_WORKTREE_PORT_OFFSET  pin a specific port offset
+  SUPABASE_WORKTREE_OFFSETS      comma-separated list of reservable offsets
+                                 (default: 50 slots, multiples of 100, 0..4900)
+
+Run inside a project that has a supabase/ folder to see the resolved ports
+and db url for the current worktree.
+EOF
+      exit 0
+      ;;
+  esac
   echo "supabase-worktree: no supabase/ directory found in this tree" >&2
   echo "  (run inside a project that has a supabase/ folder, or set SUPABASE_WORKTREE_NAME to bypass)" >&2
   exit 1

@@ -10,7 +10,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Run shellcheck
-        run: shellcheck bin/supabase-worktree
+        # Gate on real warnings + errors. Style-level findings (e.g. SC2250
+        # "prefer ${var} over $var") would otherwise fail the build for
+        # cosmetic reasons across the whole file; not a useful CI signal.
+        run: shellcheck --severity=warning bin/supabase-worktree
 
   smoke:
     runs-on: ubuntu-latest
