@@ -15,7 +15,7 @@
 #
 set -euo pipefail
 
-VERSION="0.5.0"
+VERSION="0.6.0"
 
 # --- early dispatch for context-free subcommands -----------------------------
 # `version` / `--version` / `-v` must work without a project root so that
@@ -32,7 +32,10 @@ esac
 # --- locate ROOT (the directory containing supabase/) ------------------------
 
 ROOT=""
-if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+# Check the OUTPUT, not just the exit code: inside an orphaned/de-registered
+# worktree dir `--is-inside-work-tree` prints "false" yet exits 0, and the
+# subsequent --show-toplevel would fatal under set -e.
+if [[ "$(git rev-parse --is-inside-work-tree 2>/dev/null)" == "true" ]]; then
   ROOT="$(git rev-parse --show-toplevel)"
 else
   # Walk up from $PWD looking for a supabase/ directory.
@@ -81,6 +84,13 @@ Env overrides:
   SUPABASE_WORKTREE_PORT_OFFSET  pin a specific port offset
   SUPABASE_WORKTREE_OFFSETS      comma-separated list of reservable offsets
                                  (default: 50 slots, multiples of 100, 0..4900)
+
+Config file (optional, commit it): \$ROOT/.supabase-worktree.toml
+  offsets = [0, 100, ...]        reservable port-offset pool
+  [assignments]                  pin worktree names to offsets
+  "feat-foo" = 100
+Offset precedence: env > existing generated config.toml (sticky) >
+[assignments] > sha1(name) over the pool.
 
 Run inside a project that has a supabase/ folder to see the resolved ports
 and db url for the current worktree.
@@ -150,6 +160,99 @@ fi
 
 PROJECT_ID="${BASE_PROJECT_ID}-${WORKTREE_NAME}"
 
+# --- repo config file (.supabase-worktree.toml) -------------------------------
+
+# Optional per-project config, committed at $ROOT. Two knobs:
+#
+#   # Reservable port-offset pool (replaces the built-in default list)
+#   offsets = [0, 100, 200, 300, 400, 500, 600, 700, 800, 900]
+#
+#   # Pin worktree names (slugified branch names) to specific offsets
+#   [assignments]
+#   main = 0
+#   "feat-foo" = 100
+#
+# Parsing is deliberately minimal (this is bash, not a TOML library): `offsets`
+# must be a (possibly multi-line) integer array, assignments must be one
+# `name = offset` per line. Comments and quoted keys are handled.
+CONFIG_FILE="${ROOT}/.supabase-worktree.toml"
+
+WT_DIR="${ROOT}/.supabase-worktree"
+WT_SB_DIR="${WT_DIR}/supabase"
+WT_CONFIG="${WT_SB_DIR}/config.toml"
+
+config_offsets() {
+  [[ -f "$CONFIG_FILE" ]] || return 0
+  awk '
+    /^[[:space:]]*offsets[[:space:]]*=/ { collect = 1 }
+    collect {
+      line = $0; sub(/#.*/, "", line)
+      buf = buf " " line
+      if (line ~ /\]/) exit
+    }
+    END {
+      sub(/^[^[]*\[/, "", buf)
+      sub(/\].*/, "", buf)
+      gsub(/,/, " ", buf)
+      if (buf ~ /[0-9]/) print buf
+    }
+  ' "$CONFIG_FILE"
+}
+
+# config_assignment <name> — print the offset pinned to <name>, if any.
+config_assignment() {
+  [[ -f "$CONFIG_FILE" ]] || return 0
+  awk -v name="$1" '
+    /^[[:space:]]*\[assignments\]/ { insec = 1; next }
+    /^[[:space:]]*\[/ { insec = 0 }
+    insec {
+      line = $0; sub(/#.*/, "", line); gsub(/"/, "", line)
+      eq = index(line, "=")
+      if (eq > 0) {
+        key = substr(line, 1, eq - 1); val = substr(line, eq + 1)
+        gsub(/[[:space:]]/, "", key); gsub(/[[:space:]]/, "", val)
+        if (key == name && val ~ /^[0-9]+$/) { print val; exit }
+      }
+    }
+  ' "$CONFIG_FILE"
+}
+
+# config_assigned_offsets [exclude-name] — print every pinned offset, one per
+# line, skipping the entry for [exclude-name] (pass "" to include all).
+config_assigned_offsets() {
+  [[ -f "$CONFIG_FILE" ]] || return 0
+  awk -v skip="${1:-}" '
+    /^[[:space:]]*\[assignments\]/ { insec = 1; next }
+    /^[[:space:]]*\[/ { insec = 0 }
+    insec {
+      line = $0; sub(/#.*/, "", line); gsub(/"/, "", line)
+      eq = index(line, "=")
+      if (eq > 0) {
+        key = substr(line, 1, eq - 1); val = substr(line, eq + 1)
+        gsub(/[[:space:]]/, "", key); gsub(/[[:space:]]/, "", val)
+        if (key != skip && val ~ /^[0-9]+$/) print val
+      }
+    }
+  ' "$CONFIG_FILE"
+}
+
+# existing_config_offset — read the api port out of an already-generated
+# worktree config.toml. An existing stack's ports are the ground truth: pool
+# or assignment edits must never silently desync status/psql/restore from the
+# containers that are actually running.
+existing_config_offset() {
+  [[ -f "$WT_CONFIG" ]] || return 0
+  local api
+  api="$(awk '
+    /^[[:space:]]*\[api\]/ { insec = 1; next }
+    /^[[:space:]]*\[/ { insec = 0 }
+    insec && /^[[:space:]]*port[[:space:]]*=/ { gsub(/[^0-9]/, ""); print; exit }
+  ' "$WT_CONFIG")"
+  if [[ -n "$api" ]]; then
+    echo $((api - 54321))
+  fi
+}
+
 # --- derive port offset ------------------------------------------------------
 
 # Reservable port-offset slots. A worktree's offset is picked deterministically
@@ -161,8 +264,8 @@ PROJECT_ID="${BASE_PROJECT_ID}-${WORKTREE_NAME}"
 #
 # The default list is the same 50 slots (multiples of 100, 0..4900) the old
 # formula generated, so existing worktrees keep their offset across upgrade.
-# Override the entire list with $SUPABASE_WORKTREE_OFFSETS (comma-separated).
-# Pin a specific slot with $SUPABASE_WORKTREE_PORT_OFFSET (skips derivation).
+# Pool precedence: $SUPABASE_WORKTREE_OFFSETS > `offsets` in
+# .supabase-worktree.toml > built-in default.
 OFFSETS=(
   0    100  200  300  400  500  600  700  800  900
   1000 1100 1200 1300 1400 1500 1600 1700 1800 1900
@@ -173,19 +276,69 @@ OFFSETS=(
 
 if [[ -n "${SUPABASE_WORKTREE_OFFSETS:-}" ]]; then
   IFS=',' read -r -a OFFSETS <<<"$SUPABASE_WORKTREE_OFFSETS"
+else
+  CONFIG_POOL="$(config_offsets)"
+  if [[ -n "$CONFIG_POOL" ]]; then
+    read -r -a OFFSETS <<<"$CONFIG_POOL"
+  fi
 fi
 
 if [[ ${#OFFSETS[@]} -eq 0 ]]; then
-  echo "supabase-worktree: OFFSETS list is empty (check \$SUPABASE_WORKTREE_OFFSETS)" >&2
+  echo "supabase-worktree: OFFSETS list is empty (check \$SUPABASE_WORKTREE_OFFSETS / ${CONFIG_FILE})" >&2
   exit 1
 fi
 
+# Offset precedence: $SUPABASE_WORKTREE_PORT_OFFSET > existing generated
+# config.toml (sticky — see existing_config_offset) > [assignments] pin >
+# sha1(name) over the pool, linear-probing past slots pinned to OTHER names.
+OFFSET=""
+OFFSET_SOURCE=""
+ASSIGNED_OFFSET="$(config_assignment "$WORKTREE_NAME")"
+EXISTING_OFFSET="$(existing_config_offset)"
+
 if [[ -n "${SUPABASE_WORKTREE_PORT_OFFSET:-}" ]]; then
   OFFSET="$SUPABASE_WORKTREE_PORT_OFFSET"
+  OFFSET_SOURCE="\$SUPABASE_WORKTREE_PORT_OFFSET"
+elif [[ -n "$EXISTING_OFFSET" ]]; then
+  OFFSET="$EXISTING_OFFSET"
+  OFFSET_SOURCE="existing .supabase-worktree/supabase/config.toml"
+  if [[ -n "$ASSIGNED_OFFSET" && "$ASSIGNED_OFFSET" != "$EXISTING_OFFSET" ]]; then
+    echo "supabase-worktree: warning — $(basename "$CONFIG_FILE") pins '${WORKTREE_NAME}' to offset ${ASSIGNED_OFFSET}, but the generated stack config uses ${EXISTING_OFFSET}." >&2
+    echo "                   Keeping ${EXISTING_OFFSET}. To adopt ${ASSIGNED_OFFSET}: 'supabase-worktree down', delete ${WT_CONFIG}, re-run 'init'." >&2
+  fi
+elif [[ -n "$ASSIGNED_OFFSET" ]]; then
+  OFFSET="$ASSIGNED_OFFSET"
+  OFFSET_SOURCE="pinned in $(basename "$CONFIG_FILE")"
 else
   HASH="$(printf '%s' "$WORKTREE_NAME" | shasum -a 1 | awk '{print $1}')"
   SLOT=$((0x${HASH:0:6} % ${#OFFSETS[@]}))
-  OFFSET="${OFFSETS[$SLOT]}"
+  TAKEN_OFFSETS="$(config_assigned_offsets "$WORKTREE_NAME")"
+  for ((i = 0; i < ${#OFFSETS[@]}; i++)); do
+    candidate="${OFFSETS[$(((SLOT + i) % ${#OFFSETS[@]}))]}"
+    if ! grep -qx "$candidate" <<<"$TAKEN_OFFSETS"; then
+      OFFSET="$candidate"
+      break
+    fi
+  done
+  if [[ -z "$OFFSET" ]]; then
+    echo "supabase-worktree: every offset in the pool is pinned in ${CONFIG_FILE} — free a slot or extend 'offsets'" >&2
+    exit 1
+  fi
+  OFFSET_SOURCE="derived (sha1 % ${#OFFSETS[@]} slots)"
+fi
+
+# Surface the whitelist gap: an offset outside the reservable set (pool +
+# pinned assignments — exactly what `ports` prints) yields redirect URIs the
+# OAuth console has never seen.
+OFFSET_IN_POOL=0
+for o in "${OFFSETS[@]}"; do
+  if [[ "$o" == "$OFFSET" ]]; then OFFSET_IN_POOL=1; break; fi
+done
+if [[ $OFFSET_IN_POOL -eq 0 ]] && grep -qx "$OFFSET" <<<"$(config_assigned_offsets "")"; then
+  OFFSET_IN_POOL=1
+fi
+if [[ $OFFSET_IN_POOL -eq 0 ]]; then
+  echo "supabase-worktree: note — offset ${OFFSET} is outside the reservable set; 'ports' whitelist output does not cover it." >&2
 fi
 
 WT_API=$((54321 + OFFSET))
@@ -197,9 +350,6 @@ WT_POOLER=$((54329 + OFFSET))
 WT_SHADOW=$((54330 + OFFSET))
 WT_INSPECTOR=$((8083 + OFFSET))
 
-WT_DIR="${ROOT}/.supabase-worktree"
-WT_SB_DIR="${WT_DIR}/supabase"
-WT_CONFIG="${WT_SB_DIR}/config.toml"
 WT_ENV="${WT_DIR}/.env"
 ROOT_ENV_LOCAL="${ROOT}/.env.local"
 # Optional user-supplied script run after init/up wires up env + config. Lives
@@ -440,11 +590,19 @@ EOF
     esac
   done
 
+  # The reservable set is the pool PLUS any offsets pinned in [assignments]
+  # that fall outside it — the whitelist must cover everything that can
+  # actually be in use.
+  local -a slots=()
+  while IFS= read -r off; do
+    [[ -n "$off" ]] && slots+=("$off")
+  done < <(printf '%s\n' "${OFFSETS[@]}" "$(config_assigned_offsets "")" | grep -E '^[0-9]+$' | sort -n | uniq)
+
   if [[ "$mode" == "table" || "$mode" == "all" ]]; then
     printf "%-7s %-6s %-6s %-6s %-8s %-9s %-7s %-7s %-9s %-5s\n" \
       OFFSET API DB STUDIO INBUCKET ANALYTICS POOLER SHADOW INSPECTOR NEXT
     local off api db studio inbucket analytics pooler shadow inspector next
-    for off in "${OFFSETS[@]}"; do
+    for off in "${slots[@]}"; do
       api=$((54321 + off))
       db=$((54322 + off))
       studio=$((54323 + off))
@@ -465,7 +623,7 @@ EOF
 
   if [[ "$mode" == "urls" || "$mode" == "all" ]]; then
     local off api
-    for off in "${OFFSETS[@]}"; do
+    for off in "${slots[@]}"; do
       api=$((54321 + off))
       echo "http://127.0.0.1:${api}/auth/v1/callback"
     done
@@ -495,6 +653,10 @@ cmd_status() {
   echo "project_id : ${PROJECT_ID}"
   echo "config     : ${WT_CONFIG}"
   echo "env file   : ${WT_ENV}"
+  if [[ -f "$CONFIG_FILE" ]]; then
+    echo "repo config: ${CONFIG_FILE}"
+  fi
+  echo "offset     : ${OFFSET} (${OFFSET_SOURCE})"
   if [[ -f "$HOOK_FILE" ]]; then
     if [[ -x "$HOOK_FILE" ]]; then
       echo "hook       : ${HOOK_FILE}"
@@ -735,11 +897,19 @@ Env overrides:
   SUPABASE_WORKTREE_OFFSETS      comma-separated list of reservable offsets
                                  (default: 50 slots, multiples of 100, 0..4900)
 
+Config file (optional, commit it): \$ROOT/.supabase-worktree.toml
+  offsets = [0, 100, ...]        reservable port-offset pool
+  [assignments]                  pin worktree names to offsets
+  "feat-foo" = 100
+Offset precedence: env > existing generated config.toml (sticky) >
+[assignments] > sha1(name) over the pool.
+
 Resolved for this invocation:
   root         : ${ROOT}
   name         : ${WORKTREE_NAME}
   base project : ${BASE_PROJECT_ID}
   project_id   : ${PROJECT_ID}
+  offset       : ${OFFSET} (${OFFSET_SOURCE})
   next port    : ${WT_NEXT_PORT}
   site url     : ${SITE_URL}
   db url       : ${DB_URL}

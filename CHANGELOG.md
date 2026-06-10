@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.6.0 — 2026-06-10
+
+- New committed config file: `$ROOT/.supabase-worktree.toml`. `offsets = [...]` replaces the built-in 50-slot pool (so a repo can reserve, say, 10 slots and whitelist 10 OAuth redirect URIs once); `[assignments]` pins worktree names to specific offsets. Unpinned names hash into the pool and linear-probe past slots pinned to other names, so a fresh worktree never lands on a reserved offset.
+- **Sticky ports**: when `.supabase-worktree/supabase/config.toml` has already been generated, its api port is now the source of truth for the offset. Pool or assignment edits can no longer silently desync `status` / `psql` / `restore` from the containers actually running; a warning explains how to re-init onto a newly pinned slot.
+- `ports` now prints the pool **plus** any pinned offsets outside it — the complete reservable set. `status` / `help` show the resolved offset and where it came from (env / existing config / pin / derivation), and a note flags offsets outside the reservable set (i.e. redirect URIs the OAuth console has never seen).
+- Fix: running inside an orphaned (de-registered) git worktree directory no longer dies with `fatal: this operation must be run in a work tree` — the git check now inspects the output of `--is-inside-work-tree`, not just its exit code, and falls back to directory-walk mode.
+
 ## v0.5.0 — 2026-06-10
 
 - Port offsets now come from an explicit list of reservable slots instead of `sha1 % 50 * 100`. The default list is the same 50 multiples of 100 (`0..4900`) the old formula produced, so existing worktrees keep their derived ports across upgrade — but every possible derived port is now enumerable up front. Whitelist all 50 redirect URIs in Google / GitHub / etc. once and you never need to touch the OAuth console again when a new worktree is created.
