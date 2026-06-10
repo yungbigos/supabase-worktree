@@ -65,7 +65,7 @@ Everything else (`db reset`, `migration new`, `db diff`, `gen types`, ...) you r
 | `up [supabase args]`       | `supabase start` against the isolated config          |
 | `down [supabase args]`     | `supabase stop` against the isolated config           |
 | `status`                   | Print root, name, project_id, ports, db url, running state |
-| `restore <dump-file>`      | `pg_restore` a dump into the isolated DB              |
+| `restore <dump> [--yes]`   | Two-pass `pg_restore` into the isolated DB (app schemas first, then `auth` + `storage` data-only) + reassign `public.*` ownership back to `postgres`. Confirms before wiping; pass `--yes` to skip. |
 | `psql [args...]`           | `psql` into the isolated DB                           |
 | `version`                  | Print version                                         |
 | `help`                     | Show usage                                            |
