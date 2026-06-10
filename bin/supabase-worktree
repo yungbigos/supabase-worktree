@@ -15,7 +15,7 @@
 #
 set -euo pipefail
 
-VERSION="0.2.3"
+VERSION="0.3.0"
 
 # --- locate ROOT (the directory containing supabase/) ------------------------
 
@@ -312,19 +312,185 @@ cmd_status() {
 }
 
 cmd_restore() {
-  if [[ $# -lt 1 ]]; then
-    echo "Usage: $0 restore <dump-file>" >&2
-    exit 2
+  local dump=""
+  local assume_yes=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --yes|-y) assume_yes=1; shift ;;
+      -h|--help)
+        cat <<'EOF'
+Usage: supabase-worktree restore <dump-file> [--yes]
+
+Restore a custom-format pg_dump into the isolated worktree DB. This is a
+DESTRUCTIVE operation — the worktree DB is reset before the restore.
+
+The restore runs in two passes so the local GoTrue / Storage binaries don't
+end up pointed at a prod-version schema they cannot read:
+  pass 1 — DDL + data for app schemas, EXCLUDING auth, storage, realtime,
+           _analytics, _supabase, supabase_functions.
+  pass 2 — data-only into auth + storage (keeping the local-version DDL).
+
+After the restore, ownership of public.* / cron.* / supabase_migrations.*
+objects is reassigned back to the postgres role so `supabase migration up`
+can ALTER them later.
+
+Flags:
+  --yes, -y      Skip the confirmation prompt.
+EOF
+        return 0
+        ;;
+      --*) echo "supabase-worktree restore: unknown flag: $1" >&2; return 64 ;;
+      *)
+        if [[ -z "$dump" ]]; then dump="$1"; else
+          echo "supabase-worktree restore: unexpected positional arg: $1" >&2; return 64
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  if [[ -z "$dump" ]]; then
+    echo "Usage: supabase-worktree restore <dump-file> [--yes]" >&2
+    return 2
   fi
-  local dump="$1"
   if [[ ! -f "$dump" ]]; then
-    echo "supabase-worktree: dump not found: $dump" >&2
-    exit 1
+    echo "supabase-worktree restore: dump not found: $dump" >&2
+    return 1
   fi
-  echo "supabase-worktree: restoring $dump into ${PROJECT_ID} (port ${WT_DB})"
-  pg_restore --clean --if-exists --no-owner --no-privileges \
-    --dbname "$DB_URL" \
-    "$dump"
+  if ! pg_restore -l "$dump" >/dev/null 2>&1; then
+    echo "supabase-worktree restore: $dump is not a valid custom-format pg_dump." >&2
+    echo "                           (expected output of: pg_dump -Fc ...)" >&2
+    return 65
+  fi
+
+  # supabase_admin is required to write into auth / storage / realtime during
+  # the data-only second pass. The default DB_URL uses the postgres role.
+  local admin_url="postgresql://supabase_admin:postgres@127.0.0.1:${WT_DB}/postgres"
+
+  if ! psql "$admin_url" -c 'SELECT 1' >/dev/null 2>&1; then
+    echo "supabase-worktree restore: cannot reach the worktree DB at port ${WT_DB}." >&2
+    echo "                           Start it first: supabase-worktree up" >&2
+    return 69
+  fi
+
+  local pg_major
+  pg_major=$(pg_restore --version | awk '{print $3}' | cut -d. -f1)
+  if [[ "${pg_major}" -lt 15 ]]; then
+    echo "supabase-worktree restore: warning — pg_restore v${pg_major} is older than the dump (v15+ recommended)." >&2
+  fi
+
+  echo ""
+  echo "About to restore:"
+  echo "  dump   : ${dump} ($(du -h "${dump}" | cut -f1))"
+  echo "  target : ${admin_url}"
+  echo "  worktree : ${PROJECT_ID} (db port ${WT_DB})"
+  echo ""
+  echo "This will WIPE the worktree database (supabase db reset) and replace"
+  echo "it with the contents of the dump."
+
+  if [[ $assume_yes -eq 0 ]]; then
+    echo ""
+    read -r -p "Type 'yes' to continue: " confirm
+    if [[ "${confirm}" != "yes" ]]; then
+      echo "Aborted."
+      return 1
+    fi
+  fi
+
+  echo ""
+  echo "==> Resetting worktree database to clean baseline..."
+  supabase --workdir "$WT_DIR" db reset --local
+
+  local log_file
+  log_file=$(mktemp -t supabase-worktree-restore.XXXXXX.log)
+  local managed_schemas=(auth storage realtime _analytics _supabase supabase_functions)
+  local exclude_flags=()
+  local s
+  for s in "${managed_schemas[@]}"; do exclude_flags+=(--exclude-schema="$s"); done
+
+  echo ""
+  echo "==> Pass 1: app schemas (DDL + data, excluding supabase-managed schemas)"
+  set +e
+  pg_restore \
+    --dbname="$admin_url" \
+    --no-owner --no-privileges \
+    --clean --if-exists \
+    --disable-triggers \
+    --verbose \
+    "${exclude_flags[@]}" \
+    "$dump" 2> >(tee "$log_file" >&2)
+  local exit1=$?
+
+  echo ""
+  echo "==> Pass 2: auth + storage (data-only into local-version DDL)"
+  pg_restore \
+    --dbname="$admin_url" \
+    --no-owner --no-privileges \
+    --data-only \
+    --disable-triggers \
+    --verbose \
+    --schema=auth --schema=storage \
+    "$dump" 2>> >(tee -a "$log_file" >&2)
+  local exit2=$?
+  set -e
+
+  echo ""
+  echo "==> Reassigning public.* ownership back to postgres (so 'supabase migration up' works)..."
+  # The restore ran as supabase_admin (needed for auth/storage writes); flip
+  # public-side objects back to the postgres role that migrations expect.
+  psql "$admin_url" -v ON_ERROR_STOP=1 >/dev/null <<'SQL'
+DO $$
+DECLARE r record;
+BEGIN
+  FOR r IN
+    SELECT format('ALTER TABLE %I.%I OWNER TO postgres', schemaname, tablename) AS cmd
+      FROM pg_tables WHERE schemaname IN ('public','cron','supabase_migrations')
+    UNION ALL
+    SELECT format('ALTER SEQUENCE %I.%I OWNER TO postgres', sequence_schema, sequence_name)
+      FROM information_schema.sequences WHERE sequence_schema IN ('public','cron','supabase_migrations')
+    UNION ALL
+    SELECT format('ALTER VIEW %I.%I OWNER TO postgres', schemaname, viewname)
+      FROM pg_views WHERE schemaname IN ('public','cron','supabase_migrations')
+    UNION ALL
+    SELECT format('ALTER FUNCTION %I.%I(%s) OWNER TO postgres',
+                  n.nspname, p.proname, pg_get_function_identity_arguments(p.oid))
+      FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+      WHERE n.nspname IN ('public','cron','supabase_migrations') AND p.prokind = 'f'
+    UNION ALL
+    SELECT format('ALTER PROCEDURE %I.%I(%s) OWNER TO postgres',
+                  n.nspname, p.proname, pg_get_function_identity_arguments(p.oid))
+      FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+      WHERE n.nspname IN ('public','cron','supabase_migrations') AND p.prokind = 'p'
+    UNION ALL
+    SELECT format('ALTER TYPE %I.%I OWNER TO postgres', n.nspname, t.typname)
+      FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
+      WHERE n.nspname = 'public' AND t.typtype IN ('e','c','d')
+        AND NOT EXISTS (SELECT 1 FROM pg_class c WHERE c.reltype = t.oid)
+  LOOP
+    BEGIN
+      EXECUTE r.cmd;
+    EXCEPTION WHEN OTHERS THEN
+      RAISE NOTICE 'skip: % (%)', r.cmd, SQLERRM;
+    END;
+  END LOOP;
+END $$;
+SQL
+
+  local err_count
+  err_count=$(grep -c '^pg_restore: error:' "$log_file" || true)
+
+  echo ""
+  echo "==> Done."
+  echo "    pass 1 exit : ${exit1}"
+  echo "    pass 2 exit : ${exit2}"
+  echo "    errors      : ${err_count}"
+  echo "    log         : ${log_file}"
+  if [[ "${err_count}" -gt 0 ]]; then
+    echo ""
+    echo "Some errors were logged. Most are benign (role grants, extension ownership)."
+    echo "Skim the log; if app queries work, you're good."
+  fi
 }
 
 cmd_psql() {
@@ -346,7 +512,8 @@ Commands:
   up [supabase args]    supabase start in the isolated stack
   down [supabase args]  supabase stop in the isolated stack
   status                Show root, project_id, ports, db url, running state
-  restore <dump-file>   pg_restore the dump into the isolated DB
+  restore <dump> [-y]   Restore a custom-format pg_dump into the isolated DB
+                        (two-pass: app schemas first, then auth/storage data-only)
   psql [args...]        psql into the isolated DB
   version               Print the installed version
   help                  Show this message

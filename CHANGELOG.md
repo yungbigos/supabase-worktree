@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.3.0 — 2026-06-10
+
+- `restore` is now a real two-pass restore instead of a single `pg_restore` call. Pass 1 restores DDL + data for app schemas while excluding `auth`, `storage`, `realtime`, `_analytics`, `_supabase`, and `supabase_functions` — those keep the local-version DDL so local GoTrue / Storage binaries stay compatible with a prod dump. Pass 2 then loads `auth` and `storage` data-only into the local-version tables. After both passes, ownership of `public.*` / `cron.*` / `supabase_migrations.*` objects is reassigned back to the `postgres` role so `supabase migration up` can ALTER them. The old single-pass behavior silently broke local sign-in.
+- `restore` now prompts for confirmation (use `--yes` / `-y` to skip), validates that the dump is a valid custom-format `pg_dump`, and validates that the worktree DB is reachable as `supabase_admin` before touching anything.
+- `restore` connects as `supabase_admin` (not `postgres`) since the pass-2 writes into `auth` / `storage` require it. The reassignment block at the end flips ownership back to `postgres` so subsequent `supabase migration up` works.
+
 ## v0.2.3 — 2026-06-02
 
 - Emit `PORT=${WT_NEXT_PORT}` in `.env.local` and `$WT_ENV`. Bun loads `.env.local` into `process.env` and child processes inherit it, so the spawned dev server picks up the worktree port automatically. Previously, package.json scripts using `${SUPABASE_WORKTREE_NEXT_PORT:-3000}` always fell back to 3000 because bun does **not** expose `.env`-loaded vars to script subshells (the variable is in `process.env` but not in the shell scope that expands `${VAR}`). Drop the `-p` flag from your `dev`/`start` scripts and let Next read `PORT` directly.
