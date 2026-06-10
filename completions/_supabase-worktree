@@ -9,6 +9,8 @@ _supabase_worktree() {
     'status:Show root, project_id, ports, db url, running state'
     'restore:pg_restore a dump into the isolated DB'
     'psql:psql into the isolated DB'
+    'ports:List reservable port slots + OAuth redirect URIs'
+    'hook:Run $ROOT/.supabase-worktree.hook on demand'
     'version:Print the installed version'
     'help:Show usage'
   )
@@ -20,6 +22,7 @@ _supabase_worktree() {
 
   case "${words[2]}" in
     restore) _files ;;
+    ports) _values 'ports mode' '--urls[paste-ready OAuth redirect URIs (default)]' '--table[per-slot port breakdown]' '--all[urls + table]' ;;
   esac
 }
 

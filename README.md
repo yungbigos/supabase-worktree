@@ -46,7 +46,7 @@ When you run `supabase-worktree init` (or `up`), the tool:
    1. `$SUPABASE_WORKTREE_NAME` if set.
    2. The current git branch name (slugified) if inside a git work tree.
    3. A deterministic keyword from a built-in list, seeded by `sha1(ROOT)` — stable across runs.
-2. **Derives a port offset** = `sha1(name) % 50 * 100`, applied to all Supabase service ports (api, db, studio, inbucket, analytics, pooler, shadow, inspector).
+2. **Picks a port offset** from a fixed list of 50 reservable slots (multiples of 100, `0..4900` by default), indexed by `sha1(name) % len(OFFSETS)`. The offset is applied to all Supabase service ports (api, db, studio, inbucket, analytics, pooler, shadow, inspector). Because the slot list is finite and known up front, you can whitelist all derived OAuth redirect URIs once (`supabase-worktree ports`) and new worktrees never trigger a console roundtrip.
 3. **Detects the base `project_id`** from your `supabase/config.toml` and namespaces it: `${base}-${name}`.
 4. **Creates `.supabase-worktree/supabase/`** at the project root with:
    - Symlinks back to `migrations/`, `functions/`, `schemas/`, `seeds/`, `tests/`, `templates/` — so editing those still touches the canonical source.
@@ -67,6 +67,8 @@ Everything else (`db reset`, `migration new`, `db diff`, `gen types`, ...) you r
 | `status`                   | Print root, name, project_id, ports, db url, running state |
 | `restore <dump> [--yes]`   | Two-pass `pg_restore` into the isolated DB (app schemas first, then `auth` + `storage` data-only) + reassign `public.*` ownership back to `postgres`. Confirms before wiping; pass `--yes` to skip. |
 | `psql [args...]`           | `psql` into the isolated DB                           |
+| `ports [--urls\|--table\|--all]` | List every reservable port slot. Default mode prints the Supabase auth redirect URIs to whitelist in OAuth providers (Google, GitHub, …). |
+| `hook`                     | Run `$ROOT/.supabase-worktree.hook` on demand (fires automatically after `init` / `up`) |
 | `version`                  | Print version                                         |
 | `help`                     | Show usage                                            |
 
@@ -76,7 +78,8 @@ Everything else (`db reset`, `migration new`, `db diff`, `gen types`, ...) you r
 | --------------------------------- | ----------------------------------------------- |
 | `SUPABASE_WORKTREE_NAME`          | Override the instance name                      |
 | `SUPABASE_WORKTREE_PROJECT_ID`    | Override the auto-detected base `project_id`    |
-| `SUPABASE_WORKTREE_PORT_OFFSET`   | Pin the port offset (skips sha1 derivation)     |
+| `SUPABASE_WORKTREE_PORT_OFFSET`   | Pin a specific port offset (skips slot derivation) |
+| `SUPABASE_WORKTREE_OFFSETS`       | Comma-separated list of reservable offsets (default: 50 slots, multiples of 100, `0..4900`) |
 
 ## Derived ports & env vars
 
@@ -100,7 +103,62 @@ site_url = "env(SITE_URL)"
 additional_redirect_urls = ["env(SITE_URL)"]
 ```
 
-For OAuth providers (Google, GitHub, …) the redirect-URI list in the provider console must include each derived port — either add them all up front, or only the ones you'll actually use.
+For OAuth providers (Google, GitHub, …) the redirect-URI list in the provider console must include each derived port. Because the port offsets come from a fixed slot list, you can whitelist all of them once and never touch the console again:
+
+```sh
+supabase-worktree ports                # one redirect URI per slot, paste-ready
+supabase-worktree ports --table        # full per-slot port breakdown
+supabase-worktree ports --all          # both
+```
+
+Need fewer slots (cheaper to whitelist) or different ones (avoiding ports another app on your machine grabs)? Override the list:
+
+```sh
+export SUPABASE_WORKTREE_OFFSETS="0,100,200,1400,2200,4300"
+```
+
+## Post-init hook
+
+Drop an executable script at `$ROOT/.supabase-worktree.hook` and the CLI will run it at the end of every `init` / `up`, right after `.supabase-worktree/.env`, `$ROOT/.env.local`, and the rewritten `config.toml` are in place. Typical use: copy ancillary dotfiles from the main checkout into a fresh `git worktree` (the tool only touches `.env` / `.env.local`), seed local data, or kick off project bootstrap.
+
+The hook receives the full resolved instance state via env vars — same shape as `status`:
+
+| Env var                                | Example value                                       |
+| -------------------------------------- | --------------------------------------------------- |
+| `SUPABASE_WORKTREE_ROOT`               | `/Users/me/code/myproj`                             |
+| `SUPABASE_WORKTREE_NAME`               | `feature-x`                                         |
+| `SUPABASE_WORKTREE_PROJECT_ID`         | `myproj-feature-x`                                  |
+| `SUPABASE_WORKTREE_BASE_PROJECT_ID`    | `myproj`                                            |
+| `SUPABASE_WORKTREE_PORT_OFFSET`        | `1400`                                              |
+| `SUPABASE_WORKTREE_DIR`                | `/Users/me/code/myproj/.supabase-worktree`          |
+| `SUPABASE_WORKTREE_API_PORT`           | `55721`                                             |
+| `SUPABASE_WORKTREE_DB_PORT`            | `55722`                                             |
+| `SUPABASE_WORKTREE_STUDIO_PORT`        | `55723`                                             |
+| `SUPABASE_WORKTREE_INBUCKET_PORT`      | `55724`                                             |
+| `SUPABASE_WORKTREE_ANALYTICS_PORT`     | `55727`                                             |
+| `SUPABASE_WORKTREE_POOLER_PORT`        | `55729`                                             |
+| `SUPABASE_WORKTREE_SHADOW_PORT`        | `55730`                                             |
+| `SUPABASE_WORKTREE_INSPECTOR_PORT`     | `9483`                                              |
+| `SUPABASE_WORKTREE_NEXT_PORT`          | `3014`                                              |
+| `SUPABASE_WORKTREE_SITE_URL`           | `http://localhost:3014`                             |
+| `SUPABASE_WORKTREE_DB_URL`             | `postgresql://postgres:postgres@127.0.0.1:55722/postgres` |
+
+Because it fires on every `init` / `up` (matching how `.env` is regenerated), keep hooks idempotent. Run it on demand with `supabase-worktree hook`.
+
+Minimal example — copy an extra dotfile from a sibling main checkout into a fresh worktree:
+
+```sh
+#!/usr/bin/env bash
+# $ROOT/.supabase-worktree.hook — chmod +x me, then commit.
+set -euo pipefail
+main_root="$(dirname "$SUPABASE_WORKTREE_ROOT")/myproj-main"
+for f in .env.development.local; do
+  if [[ -f "$main_root/$f" && ! -f "$SUPABASE_WORKTREE_ROOT/$f" ]]; then
+    cp "$main_root/$f" "$SUPABASE_WORKTREE_ROOT/$f"
+    echo "hook: copied $f from $main_root"
+  fi
+done
+```
 
 ## Enforcing usage from agent rules (CLAUDE.md / AGENTS.md)
 
