@@ -46,7 +46,11 @@ When you run `supabase-worktree init` (or `up`), the tool:
    1. `$SUPABASE_WORKTREE_NAME` if set.
    2. The current git branch name (slugified) if inside a git work tree.
    3. A deterministic keyword from a built-in list, seeded by `sha1(ROOT)` — stable across runs.
-2. **Picks a port offset** from a fixed list of 50 reservable slots (multiples of 100, `0..4900` by default), indexed by `sha1(name) % len(OFFSETS)`. The offset is applied to all Supabase service ports (api, db, studio, inbucket, analytics, pooler, shadow, inspector). Because the slot list is finite and known up front, you can whitelist all derived OAuth redirect URIs once (`supabase-worktree ports`) and new worktrees never trigger a console roundtrip.
+2. **Picks a port offset**, in order of precedence:
+   1. `$SUPABASE_WORKTREE_PORT_OFFSET` if set.
+   2. The api port of an already-generated `.supabase-worktree/supabase/config.toml` — **existing stacks keep their ports forever**, no matter how the pool or assignments change underneath them.
+   3. An explicit pin for this name in `.supabase-worktree.toml` (`[assignments]`, see below).
+   4. `sha1(name)` over the reservable pool (50 slots — multiples of 100, `0..4900` — unless the config file or `$SUPABASE_WORKTREE_OFFSETS` shrinks it), linear-probing past slots pinned to other names. The offset is applied to all Supabase service ports (api, db, studio, inbucket, analytics, pooler, shadow, inspector). Because the slot set is finite and known up front, you can whitelist all derived OAuth redirect URIs once (`supabase-worktree ports`) and new worktrees never trigger a console roundtrip.
 3. **Detects the base `project_id`** from your `supabase/config.toml` and namespaces it: `${base}-${name}`.
 4. **Creates `.supabase-worktree/supabase/`** at the project root with:
    - Symlinks back to `migrations/`, `functions/`, `schemas/`, `seeds/`, `tests/`, `templates/` — so editing those still touches the canonical source.
@@ -117,6 +121,34 @@ Need fewer slots (cheaper to whitelist) or different ones (avoiding ports anothe
 export SUPABASE_WORKTREE_OFFSETS="0,100,200,1400,2200,4300"
 ```
 
+…or better, commit the choice to the repo with a config file (below) so every checkout and teammate resolves the same ports.
+
+## Config file: `.supabase-worktree.toml`
+
+Drop a `.supabase-worktree.toml` at the project root (commit it) to make port assignment fully predictable:
+
+```toml
+# Reservable port-offset pool. New worktrees hash into this pool, so the OAuth
+# redirect whitelist printed by `supabase-worktree ports` never changes.
+offsets = [0, 100, 200, 300, 400, 500, 600, 700, 800, 900]
+
+# Pin worktree names (slugified branch names: feat/foo → feat-foo) to offsets.
+# Use this to keep a long-lived stack on its already-whitelisted port, or to
+# resolve a hash collision between two simultaneously running worktrees.
+[assignments]
+main = 1400
+"feat-foo" = 100
+```
+
+Semantics:
+
+- `offsets` replaces the built-in 50-slot pool (`$SUPABASE_WORKTREE_OFFSETS` still wins over it). A small pool means a short whitelist; collisions only matter for worktrees running *at the same time*, and pins resolve them.
+- `[assignments]` pins beat hash derivation. Unpinned names hash into the pool and linear-probe past slots pinned to other names, so a fresh worktree never lands on a reserved offset.
+- **Existing stacks are sticky**: once `.supabase-worktree/supabase/config.toml` has been generated, its ports win over pool and assignment edits (a warning tells you when they disagree, and how to re-init onto the pinned slot). `status` shows where the offset came from.
+- `supabase-worktree ports` prints the pool **plus** any pinned offsets outside it — the complete set of redirect URIs that can ever be in use. Paste it into Google / GitHub once.
+
+Parsing is deliberately minimal (bash, not a TOML library): `offsets` must be an integer array (multi-line is fine), assignments one `name = offset` per line.
+
 ## Post-init hook
 
 Drop an executable script at `$ROOT/.supabase-worktree.hook` and the CLI will run it at the end of every `init` / `up`, right after `.supabase-worktree/.env`, `$ROOT/.env.local`, and the rewritten `config.toml` are in place. Typical use: copy ancillary dotfiles from the main checkout into a fresh `git worktree` (the tool only touches `.env` / `.env.local`), seed local data, or kick off project bootstrap.
@@ -179,7 +211,7 @@ This project uses [`supabase-worktree`](https://github.com/yungbigos/supabase-wo
 ## Limitations
 
 - **Port rewrite assumes Supabase defaults.** If you've customized ports in `supabase/config.toml`, the literal `port = 54321` replacements won't match. A TOML-aware rewrite is planned for v0.2.
-- **Port collisions are possible.** The hash space is 50 slots; if you have 7+ worktrees the chance of a collision is non-trivial. `status` shows your chosen ports — set `SUPABASE_WORKTREE_PORT_OFFSET` if you hit one.
+- **Port collisions are possible.** Two names can hash to the same slot; the chance grows with worktree count and shrinks the pool. Collisions only bite when both stacks run simultaneously — pin one of them in `.supabase-worktree.toml` `[assignments]` (or set `SUPABASE_WORKTREE_PORT_OFFSET`) to resolve. `status` shows your chosen ports and where the offset came from.
 - **`config.toml` is copied, not symlinked.** Edits to the source `config.toml` (e.g. enabling a new auth provider) won't propagate to existing isolated stacks. Delete `.supabase-worktree/supabase/config.toml` and re-run `init` to regenerate.
 - **`.supabase-worktree/.env` is a snapshot, not a symlink.** Re-run `init` (or just `up`, which always refreshes the env) after editing the repo `.env` so the values reach the supabase CLI. The trade-off vs. a symlink is that per-instance overrides (`SITE_URL`, `SUPABASE_URL`) can live in the same file.
 
