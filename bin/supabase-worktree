@@ -175,7 +175,21 @@ PROJECT_ID="${BASE_PROJECT_ID}-${WORKTREE_NAME}"
 # Parsing is deliberately minimal (this is bash, not a TOML library): `offsets`
 # must be a (possibly multi-line) integer array, assignments must be one
 # `name = offset` per line. Comments and quoted keys are handled.
+#
+# Resolve the config from the MAIN worktree root, not the current $ROOT. The
+# port pool is a per-project invariant, but git linked worktrees check out
+# whatever the branch contains — a branch forked before the config was
+# committed has no .supabase-worktree.toml, so reading it from $ROOT would
+# silently fall back to the built-in default pool and scatter ports outside
+# the whitelist. The committed config lives once at the primary worktree
+# (parent of --git-common-dir); every linked worktree shares it.
 CONFIG_FILE="${ROOT}/.supabase-worktree.toml"
+if MAIN_GIT_COMMON="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"; then
+  MAIN_ROOT="$(dirname "$MAIN_GIT_COMMON")"
+  if [[ -f "${MAIN_ROOT}/.supabase-worktree.toml" ]]; then
+    CONFIG_FILE="${MAIN_ROOT}/.supabase-worktree.toml"
+  fi
+fi
 
 WT_DIR="${ROOT}/.supabase-worktree"
 WT_SB_DIR="${WT_DIR}/supabase"
@@ -253,6 +267,30 @@ existing_config_offset() {
   fi
 }
 
+# sibling_taken_offsets — offsets already claimed by OTHER worktrees' generated
+# stacks (one per line). `init` probes past these so a fresh worktree lands on a
+# free pool slot instead of colliding on host ports with a sibling — two stacks
+# on the same offset bind the same ports, so only one can run at a time. Reads
+# each linked worktree's .supabase-worktree/supabase/config.toml api port. Empty
+# (silent) outside a git repo.
+sibling_taken_offsets() {
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
+  local line wt cfg api
+  while IFS= read -r line; do
+    [[ "$line" == worktree\ * ]] || continue
+    wt="${line#worktree }"
+    [[ "$wt" == "$ROOT" ]] && continue
+    cfg="${wt}/.supabase-worktree/supabase/config.toml"
+    [[ -f "$cfg" ]] || continue
+    api="$(awk '
+      /^[[:space:]]*\[api\]/ { insec = 1; next }
+      /^[[:space:]]*\[/ { insec = 0 }
+      insec && /^[[:space:]]*port[[:space:]]*=/ { gsub(/[^0-9]/, ""); print; exit }
+    ' "$cfg")"
+    [[ -n "$api" ]] && echo $((api - 54321))
+  done < <(git worktree list --porcelain 2>/dev/null)
+}
+
 # --- derive port offset ------------------------------------------------------
 
 # Reservable port-offset slots. A worktree's offset is picked deterministically
@@ -312,19 +350,43 @@ elif [[ -n "$ASSIGNED_OFFSET" ]]; then
 else
   HASH="$(printf '%s' "$WORKTREE_NAME" | shasum -a 1 | awk '{print $1}')"
   SLOT=$((0x${HASH:0:6} % ${#OFFSETS[@]}))
-  TAKEN_OFFSETS="$(config_assigned_offsets "$WORKTREE_NAME")"
+  PINNED_OFFSETS="$(config_assigned_offsets "$WORKTREE_NAME")"
+  SIBLING_OFFSETS="$(sibling_taken_offsets)"
+  AVOID_OFFSETS="$(printf '%s\n%s\n' "$PINNED_OFFSETS" "$SIBLING_OFFSETS")"
+
+  # Pass 1: first slot that is neither pinned to another name nor already claimed
+  # by a sibling worktree — a genuinely free port set, no runtime collision.
   for ((i = 0; i < ${#OFFSETS[@]}; i++)); do
     candidate="${OFFSETS[$(((SLOT + i) % ${#OFFSETS[@]}))]}"
-    if ! grep -qx "$candidate" <<<"$TAKEN_OFFSETS"; then
+    if ! grep -qx "$candidate" <<<"$AVOID_OFFSETS"; then
       OFFSET="$candidate"
+      OFFSET_SOURCE="derived (sha1, first free of ${#OFFSETS[@]} slots)"
       break
     fi
   done
+
+  # Pass 2: every slot is already claimed by a sibling. Fall back to the first
+  # non-pinned slot (original behaviour) and warn — this stack shares host ports
+  # with a sibling, so the two can't run simultaneously.
+  if [[ -z "$OFFSET" ]]; then
+    for ((i = 0; i < ${#OFFSETS[@]}; i++)); do
+      candidate="${OFFSETS[$(((SLOT + i) % ${#OFFSETS[@]}))]}"
+      if ! grep -qx "$candidate" <<<"$PINNED_OFFSETS"; then
+        OFFSET="$candidate"
+        OFFSET_SOURCE="derived (sha1 % ${#OFFSETS[@]} slots — pool saturated)"
+        break
+      fi
+    done
+    if [[ -n "$OFFSET" ]]; then
+      echo "supabase-worktree: note — all ${#OFFSETS[@]} pool slots are claimed by other worktrees; this stack takes offset ${OFFSET} and shares host ports with a sibling (only one of them can run at a time)." >&2
+      echo "                   Stop the colliding stack, or extend 'offsets' in $(basename "$CONFIG_FILE") and whitelist the new redirect URIs once." >&2
+    fi
+  fi
+
   if [[ -z "$OFFSET" ]]; then
     echo "supabase-worktree: every offset in the pool is pinned in ${CONFIG_FILE} — free a slot or extend 'offsets'" >&2
     exit 1
   fi
-  OFFSET_SOURCE="derived (sha1 % ${#OFFSETS[@]} slots)"
 fi
 
 # Surface the whitelist gap: an offset outside the reservable set (pool +
