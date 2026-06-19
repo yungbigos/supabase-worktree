@@ -15,7 +15,7 @@
 #
 set -euo pipefail
 
-VERSION="0.6.0"
+VERSION="0.7.0"
 
 # --- early dispatch for context-free subcommands -----------------------------
 # `version` / `--version` / `-v` must work without a project root so that
@@ -64,6 +64,12 @@ Commands:
   init                  Generate .supabase-worktree/supabase/config.toml + symlinks
   up [supabase args]    supabase start in the isolated stack
   down [supabase args]  supabase stop in the isolated stack
+  ls                    List every stack for this base project + running state
+  down-all [--purge] [--keep name[,name]...]
+                        Stop every stack of this base project, sparing --keep
+                        (full project_id or short suffix). --purge deletes
+                        data volumes (passes --no-backup to supabase stop).
+  prune [--keep ...]    Alias for: down-all --purge
   status                Show root, project_id, ports, db url, running state
   restore <dump> [-y]   Restore a custom-format pg_dump into the isolated DB
                         (two-pass: app schemas first, then auth/storage data-only)
@@ -709,6 +715,108 @@ cmd_down() {
   supabase --workdir "$WT_DIR" stop "$@"
 }
 
+# --- multi-stack helpers -----------------------------------------------------
+# Every isolated stack is tagged with the docker label `com.supabase.cli.project`
+# set to its project_id (e.g. `fixos-perf-search-tier0`). A stack "belongs to"
+# this base project when its id equals BASE_PROJECT_ID or is prefixed with
+# `${BASE_PROJECT_ID}-`. We enumerate from container labels AND from
+# `supabase_db_<id>` volume names so cleanly-stopped stacks (containers removed,
+# volumes persisted) are still listed and reapable.
+_swt_belongs() {
+  [[ "$1" == "$BASE_PROJECT_ID" || "$1" == "${BASE_PROJECT_ID}-"* ]]
+}
+
+_swt_project_stacks() {
+  {
+    docker ps -a --format '{{.Label "com.supabase.cli.project"}}' 2>/dev/null
+    docker volume ls --format '{{.Name}}' 2>/dev/null | sed -n 's/^supabase_db_//p'
+  } | awk 'NF' | sort -u | while IFS= read -r p; do
+      _swt_belongs "$p" && echo "$p"
+    done
+}
+
+_swt_stack_running() {
+  docker ps --format '{{.Label "com.supabase.cli.project"}}' 2>/dev/null \
+    | grep -qx "$1"
+}
+
+cmd_ls() {
+  local p state mark found=0
+  while IFS= read -r p; do
+    [[ -z "$p" ]] && continue
+    found=1
+    if _swt_stack_running "$p"; then state="RUNNING"; else state="stopped"; fi
+    if [[ "$p" == "$PROJECT_ID" ]]; then mark="*"; else mark=" "; fi
+    printf "%s %-8s %s\n" "$mark" "$state" "$p"
+  done < <(_swt_project_stacks)
+  if [[ "$found" == 0 ]]; then
+    echo "No '${BASE_PROJECT_ID}' stacks found."
+  else
+    echo
+    echo "(* = current worktree '${WORKTREE_NAME}')"
+  fi
+}
+
+# down-all [--purge|--no-backup] [--keep name[,name]...] ...
+# Stops every stack belonging to this base project. --keep (repeatable, or
+# comma-separated) spares stacks by full project_id OR short suffix
+# (e.g. both `fixos-perf-search-tier0` and `perf-search-tier0` match).
+# --purge passes --no-backup to `supabase stop`, deleting data volumes.
+cmd_down_all() {
+  local purge=0
+  local KEEP=()
+  local _add_keep_arg item
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --purge|--no-backup) purge=1; shift ;;
+      --keep=*) _add_keep_arg="${1#--keep=}"; shift ;;
+      --keep)
+        shift
+        if [[ $# -eq 0 ]]; then
+          echo "down-all: --keep needs a value" >&2; exit 2
+        fi
+        _add_keep_arg="$1"; shift ;;
+      -h|--help)
+        echo "usage: $(basename "$0") down-all [--purge] [--keep name[,name]...]"
+        return 0 ;;
+      *) echo "down-all: unknown argument '$1'" >&2; exit 2 ;;
+    esac
+    if [[ -n "${_add_keep_arg:-}" ]]; then
+      local oldifs="$IFS"; IFS=','
+      for item in $_add_keep_arg; do
+        [[ -n "$item" ]] && KEEP+=("$item")
+      done
+      IFS="$oldifs"
+      _add_keep_arg=""
+    fi
+  done
+
+  local stopflags=()
+  [[ "$purge" == 1 ]] && stopflags=(--no-backup)
+
+  local p k short kept any=0
+  while IFS= read -r p; do
+    [[ -z "$p" ]] && continue
+    short="${p#${BASE_PROJECT_ID}-}"
+    kept=0
+    for k in "${KEEP[@]+"${KEEP[@]}"}"; do
+      if [[ "$k" == "$p" || "$k" == "$short" ]]; then kept=1; break; fi
+    done
+    if [[ "$kept" == 1 ]]; then
+      echo "=== keeping  $p ==="
+      continue
+    fi
+    any=1
+    if [[ "$purge" == 1 ]]; then
+      echo "=== stopping $p (purging volumes) ==="
+    else
+      echo "=== stopping $p ==="
+    fi
+    supabase stop "${stopflags[@]+"${stopflags[@]}"}" --project-id "$p" || true
+  done < <(_swt_project_stacks)
+  [[ "$any" == 0 ]] && echo "Nothing to stop."
+}
+
 cmd_status() {
   echo "root       : ${ROOT}"
   echo "name       : ${WORKTREE_NAME}"
@@ -938,6 +1046,12 @@ Commands:
   init                  Generate .supabase-worktree/supabase/config.toml + symlinks
   up [supabase args]    supabase start in the isolated stack
   down [supabase args]  supabase stop in the isolated stack
+  ls                    List every stack for this base project + running state
+  down-all [--purge] [--keep name[,name]...]
+                        Stop every stack of this base project, sparing --keep
+                        (full project_id or short suffix). --purge deletes
+                        data volumes (passes --no-backup to supabase stop).
+  prune [--keep ...]    Alias for: down-all --purge
   status                Show root, project_id, ports, db url, running state
   restore <dump> [-y]   Restore a custom-format pg_dump into the isolated DB
                         (two-pass: app schemas first, then auth/storage data-only)
@@ -986,6 +1100,9 @@ case "$cmd" in
   init)            cmd_init    "$@" ;;
   up)              cmd_up      "$@" ;;
   down)            cmd_down    "$@" ;;
+  ls|list)         cmd_ls ;;
+  down-all)        cmd_down_all "$@" ;;
+  prune)           cmd_down_all --purge "$@" ;;
   status)          cmd_status  "$@" ;;
   restore)         cmd_restore "$@" ;;
   psql)            cmd_psql    "$@" ;;
