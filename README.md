@@ -192,6 +192,53 @@ for f in .env.development.local; do
 done
 ```
 
+### Worked example — a git submodule's `.env`, port-adjusted
+
+The tool regenerates the repo-root `.env` / `.env.local` with the worktree's
+ports, but it doesn't reach into git submodules. A common setup: edge functions
+(or any sub-service) live in a submodule with a **gitignored `.env`** whose
+secrets exist only in the primary checkout, and whose Supabase URL must point at
+*this* worktree's API port.
+
+This hook resolves the primary checkout via `git rev-parse --git-common-dir`
+(no hardcoded sibling path), populates the submodule, copies its `.env` from the
+primary, and rewrites just the port-bearing URLs to `SUPABASE_WORKTREE_API_PORT`.
+It's idempotent and a no-op in the primary checkout (which *is* the source):
+
+```sh
+#!/usr/bin/env bash
+# $ROOT/.supabase-worktree.hook — chmod +x me, then commit.
+set -euo pipefail
+
+root="$SUPABASE_WORKTREE_ROOT"
+submodule="supabase/functions"   # adjust to your submodule path
+
+# The primary checkout holds the source-of-truth .env. git-common-dir points at
+# <primary>/.git for every linked worktree; its parent is the primary checkout.
+main="$(dirname "$(git -C "$root" rev-parse --path-format=absolute --git-common-dir)")"
+[[ "$root" == "$main" ]] && exit 0   # nothing to do in the primary itself
+
+git -C "$root" submodule update --init "$submodule" >/dev/null 2>&1 || true
+
+src="$main/$submodule/.env"
+dst="$root/$submodule/.env"
+[[ -f "$src" ]] || { echo "hook: no $src to copy — skipping" >&2; exit 0; }
+
+api_url="http://127.0.0.1:${SUPABASE_WORKTREE_API_PORT}"
+# Copy verbatim (keeps secrets), then repoint only the Supabase URLs.
+sed -E \
+  -e "s|^(SUPABASE_URL=).*|\1${api_url}|" \
+  -e "s|^(FUNCTIONS_URL=).*|\1${api_url}|" \
+  "$src" > "$dst"
+echo "hook: wrote $submodule/.env (Supabase URL -> ${api_url})"
+```
+
+Shared, single-instance side-services (a queue, a mailer) are the mirror case:
+because only one worktree's stack can own them at a time, repoint those with an
+**explicit** command you run from the active worktree — not from the hook, which
+fires on every `init` (even for a worktree you haven't started) and would
+silently steal the service from a running stack.
+
 ## Enforcing usage from agent rules (CLAUDE.md / AGENTS.md)
 
 If you work with Claude Code, Cursor, or any other agent that reads project rules, add a section like this so the agent doesn't `supabase start` against the shared root stack from inside a worktree:
