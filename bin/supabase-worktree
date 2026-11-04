@@ -4,7 +4,9 @@
 #
 # Each instance gets a deterministic port offset derived from its name, a unique
 # `project_id`, and symlinks back to the source `supabase/` directory so
-# migrations / seeds / schemas / functions / templates / tests all just work.
+# migrations / seeds / schemas / functions / tests all just work. Email
+# templates are copied instead (see sync_templates), and so are functions when
+# Supabase CLI v3 can't start on the source tree as is (see sync_functions).
 #
 # The instance name is chosen in this order of precedence:
 #   1. $SUPABASE_WORKTREE_NAME           (explicit override)
@@ -15,7 +17,7 @@
 #
 set -euo pipefail
 
-VERSION="0.7.0"
+VERSION="0.7.2"
 
 # --- early dispatch for context-free subcommands -----------------------------
 # `version` / `--version` / `-v` must work without a project root so that
@@ -581,12 +583,179 @@ run_post_init_hook() {
     "$HOOK_FILE"
 }
 
+# sync_templates — copy supabase/templates into the instance dir; never link it.
+# The Supabase CLI resolves auth.email.*.content_path through symlinks and
+# refuses a path that lands outside the --workdir, so a templates symlink back
+# to ../../supabase/templates makes `start` fail. A copy keeps the path inside
+# the workdir. It is refreshed on every init / up, so template edits reach the
+# stack on the next `up`.
+sync_templates() {
+  local src="${ROOT}/supabase/templates"
+  local dst="${WT_SB_DIR}/templates"
+  [[ -d "$src" && -n "$WT_SB_DIR" ]] || return 0
+  # rm never follows a symlink given as its operand, so the link an older
+  # version created goes away without touching the templates it pointed at.
+  rm -rf "$dst"
+  cp -R "$src" "$dst"
+}
+
+# cli_at_least <major> — true when the installed Supabase CLI is at least that
+# major version. The version is read once per run into SUPABASE_CLI_VERSION.
+SUPABASE_CLI_VERSION=""
+cli_at_least() {
+  if [[ -z "$SUPABASE_CLI_VERSION" ]]; then
+    SUPABASE_CLI_VERSION="$(supabase --version 2>/dev/null | head -n 1)" || true
+    SUPABASE_CLI_VERSION="${SUPABASE_CLI_VERSION:-unknown}"
+  fi
+  local major="${SUPABASE_CLI_VERSION#v}"
+  major="${major%%.*}"
+  [[ "$major" =~ ^[0-9]+$ ]] && (( major >= $1 ))
+}
+
+# adapt_config_to_cli — rename config sections the installed CLI no longer reads.
+# Supabase CLI v3 refuses a config.toml that still has [inbucket] (or a
+# [remotes.<name>.inbucket] block); the same keys live under [local_smtp]. Only
+# the generated copy is rewritten, and only for a CLI that needs it: the source
+# config.toml stays readable by an older CLI, such as one CI pins from before
+# [local_smtp] existed.
+adapt_config_to_cli() {
+  [[ -f "$WT_CONFIG" ]] || return 0
+  cli_at_least 3 || return 0
+  grep -Eq '^\[(remotes\.[^]]+\.)?inbucket\]' "$WT_CONFIG" || return 0
+  sed -E 's/^\[(remotes\.[^]]+\.)?inbucket\]/[\1local_smtp]/' "$WT_CONFIG" > "${WT_CONFIG}.tmp"
+  mv "${WT_CONFIG}.tmp" "$WT_CONFIG"
+  echo "supabase-worktree: renamed [inbucket] to [local_smtp] in ${WT_CONFIG} (Supabase CLI ${SUPABASE_CLI_VERSION})"
+}
+
+# Marker file inside a functions copy made by sync_functions, so a later run
+# only ever deletes a directory this tool created.
+FUNCTIONS_COPY_MARKER=".supabase-worktree-copy"
+
+# functions_blocking_files <src> — print the top-level files of <src> whose
+# names look like a function slug. Supabase CLI v3 `start` probes
+# <entry>/index.ts for every such entry and aborts on a file ("BadResource:
+# FileSystem.access …/Dockerfile/index.ts"). Names with a dot never match.
+functions_blocking_files() {
+  local entry name
+  for entry in "$1"/*; do
+    [[ -e "$entry" && ! -d "$entry" ]] || continue
+    name="${entry##*/}"
+    if [[ "$name" =~ ^[A-Za-z0-9_-]+$ ]]; then
+      echo "$name"
+    fi
+  done
+}
+
+# functions_missing_declared <src> — print each [functions.<name>] in the
+# instance config.toml that has no <src>/<name>. Supabase CLI v3 `start`
+# aborts on these ("failed to read file: …/<name>/index.ts").
+functions_missing_declared() {
+  local name
+  [[ -f "$WT_CONFIG" ]] || return 0
+  while IFS= read -r name; do
+    if [[ -n "$name" && ! -e "$1/$name" ]]; then
+      echo "$name"
+    fi
+  done < <(sed -nE 's/^[[:space:]]*\[functions\.([A-Za-z0-9_-]+)\][[:space:]]*(#.*)?$/\1/p' "$WT_CONFIG")
+}
+
+# sync_functions — give the instance dir its supabase/functions.
+#
+# Normally that is a symlink to ../../supabase/functions, so edits reach the
+# running edge runtime at once. Under Supabase CLI v3, a source tree that would
+# make `start` abort (see functions_blocking_files / functions_missing_declared;
+# e.g. a functions git submodule with a Dockerfile at its root) gets a copy
+# instead. The copy leaves those files out, adds a stub that answers 501 for
+# each declared function without source, and is re-synced on every init / up,
+# so source edits reach the stack on the next `up`.
+#
+# Links can't do this job. The edge runtime loads a function from its real
+# path, so one reached through a link inside the instance dir fails with
+# "Module not found" — the copy has to hold real files.
+sync_functions() {
+  local src="${ROOT}/supabase/functions"
+  local dst="${WT_SB_DIR}/functions"
+  [[ -d "$src" && -n "$WT_SB_DIR" ]] || return 0
+
+  local blocking="" missing=""
+  if cli_at_least 3; then
+    blocking="$(functions_blocking_files "$src")"
+    missing="$(functions_missing_declared "$src")"
+  fi
+
+  if [[ -z "$blocking" && -z "$missing" ]]; then
+    if [[ -d "$dst" && ! -L "$dst" ]]; then
+      if [[ ! -f "${dst}/${FUNCTIONS_COPY_MARKER}" ]]; then
+        echo "supabase-worktree: ${dst} is a directory this tool did not create; leaving it" >&2
+        return 0
+      fi
+      rm -rf "$dst"
+    fi
+    if [[ ! -e "$dst" && ! -L "$dst" ]]; then
+      ln -s "../../supabase/functions" "$dst"
+    fi
+    return 0
+  fi
+
+  if ! command -v rsync >/dev/null 2>&1; then
+    echo "supabase-worktree: rsync is required to copy ${src} for Supabase CLI ${SUPABASE_CLI_VERSION}" >&2
+    return 1
+  fi
+  if [[ -d "$dst" && ! -L "$dst" && ! -f "${dst}/${FUNCTIONS_COPY_MARKER}" ]]; then
+    echo "supabase-worktree: ${dst} is a directory this tool did not create; move it away and re-run" >&2
+    return 1
+  fi
+  # rm never follows a symlink given as its operand: this drops the link an
+  # earlier run made, not the functions it points at.
+  if [[ -L "$dst" ]]; then
+    rm -f "$dst"
+  fi
+  mkdir -p "$dst"
+
+  # Excluded names are neither copied nor deleted by --delete, which keeps the
+  # stubs and the marker in place across syncs. The submodule's .git link would
+  # point nowhere from the copy, so it stays out too. Synced into the existing
+  # directory (never replaced) so a running edge runtime keeps its mount.
+  local name
+  local -a args=(-a --delete --exclude "/.git" --exclude "/${FUNCTIONS_COPY_MARKER}")
+  while IFS= read -r name; do
+    if [[ -n "$name" ]]; then
+      args+=(--exclude "/${name}")
+    fi
+  done <<< "${blocking}
+${missing}"
+  rsync "${args[@]}" "${src}/" "${dst}/"
+
+  printf '%s\n' \
+    "Made by supabase-worktree: a copy of supabase/functions for Supabase CLI ${SUPABASE_CLI_VERSION}," \
+    "re-synced on every init / up. Edit the source, not this copy." > "${dst}/${FUNCTIONS_COPY_MARKER}"
+
+  while IFS= read -r name; do
+    [[ -n "$name" && ! -e "${dst}/${name}/index.ts" ]] || continue
+    mkdir -p "${dst}/${name}"
+    cat > "${dst}/${name}/index.ts" <<EOF
+// Stub made by supabase-worktree: config.toml declares [functions.${name}],
+// but supabase/functions/${name} does not exist in this checkout.
+Deno.serve(() => new Response('${name}: no source in this checkout', { status: 501 }));
+EOF
+  done <<< "$missing"
+
+  echo "supabase-worktree: synced ${src} into ${dst} (Supabase CLI ${SUPABASE_CLI_VERSION} can't start on it as is)"
+  if [[ -n "$blocking" ]]; then
+    echo "  left out: $(echo "$blocking" | paste -sd ' ' -)"
+  fi
+  if [[ -n "$missing" ]]; then
+    echo "  stubbed (declared, no source): $(echo "$missing" | paste -sd ' ' -)"
+  fi
+  echo "  source edits reach the stack on the next \`up\`"
+}
+
 # --- subcommands -------------------------------------------------------------
 
 cmd_init() {
   mkdir -p "$WT_SB_DIR"
 
-  for d in migrations functions schemas seeds tests templates; do
+  for d in migrations schemas seeds tests; do
     src="${ROOT}/supabase/$d"
     dst="${WT_SB_DIR}/$d"
     if [[ -e "$src" && ! -e "$dst" ]]; then
@@ -594,12 +763,18 @@ cmd_init() {
     fi
   done
 
+  sync_templates
+
   write_wt_env
   write_root_env_local
 
+  # functions/ is synced after the hook: it reads the generated config.toml,
+  # and a hook may write files into supabase/functions (e.g. its .env).
   if [[ -f "$WT_CONFIG" ]]; then
     echo "supabase-worktree: config already present at $WT_CONFIG"
+    adapt_config_to_cli
     run_post_init_hook
+    sync_functions
     return 0
   fi
 
@@ -615,6 +790,7 @@ cmd_init() {
     -e "s|inspector_port = 8083|inspector_port = ${WT_INSPECTOR}|" \
     -e "s|127.0.0.1:54321|127.0.0.1:${WT_API}|g" \
     "$SOURCE_CONFIG" > "$WT_CONFIG"
+  adapt_config_to_cli
 
   echo "supabase-worktree: wrote ${WT_CONFIG}"
   echo "  project_id: ${PROJECT_ID}"
@@ -622,6 +798,7 @@ cmd_init() {
     "$WT_API" "$WT_DB" "$WT_STUDIO" "$WT_INBUCKET" "$WT_ANALYTICS" "$WT_POOLER" "$WT_SHADOW" "$WT_INSPECTOR"
 
   run_post_init_hook
+  sync_functions
 }
 
 cmd_up() {

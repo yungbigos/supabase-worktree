@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.7.2 — 2026-11-04
+
+- Fix: `up` failed on Supabase CLI 3 with `BadResource: FileSystem.access (…/supabase/functions/Dockerfile/index.ts)` when `supabase/functions` holds a top-level file named like a function, such as the `Dockerfile` at the root of a functions git submodule. CLI 3 `start` probes `<entry>/index.ts` for every such entry and aborts on a file. It also aborts with `failed to read file: …/<name>/index.ts` when `config.toml` declares `[functions.<name>]` with settings but the source has no `<name>/`. In either case `.supabase-worktree/supabase/functions` is now an rsync'd copy instead of a symlink: it leaves out those files and has a stub answering 501 for each missing function. The copy is re-synced on every `init` / `up`. Everything else keeps the symlink, and so does an older CLI. Links into the source can't stand in for the copy: the edge runtime loads a function from its real path, and one reached through a link fails with "Module not found".
+
+## v0.7.1 — 2026-11-04
+
+- Fix: `up` failed on Supabase CLI 2.122+ with `StartInvalidConfigError … content_path … resolves outside the project root`. The CLI now resolves `auth.email.*.content_path` through symlinks and rejects a path outside the `--workdir`, and `templates/` was a symlink back to `../../supabase/templates`. `templates/` is now copied into `.supabase-worktree/supabase/` and refreshed on every `init` / `up`; an existing symlink from an older version is replaced on the next run. The other directories stay symlinked, since the CLI checks only the email-template paths.
+- `[inbucket]` is renamed to `[local_smtp]` in the generated `config.toml` when the installed CLI is v3 or later, since CLI 3 refuses the old section name. The source `config.toml` is left as is.
+
 ## v0.6.0 — 2026-06-10
 
 - New committed config file: `$ROOT/.supabase-worktree.toml`. `offsets = [...]` replaces the built-in 50-slot pool (so a repo can reserve, say, 10 slots and whitelist 10 OAuth redirect URIs once); `[assignments]` pins worktree names to specific offsets. Unpinned names hash into the pool and linear-probe past slots pinned to other names, so a fresh worktree never lands on a reserved offset.
