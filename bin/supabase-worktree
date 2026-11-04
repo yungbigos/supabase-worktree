@@ -4,7 +4,8 @@
 #
 # Each instance gets a deterministic port offset derived from its name, a unique
 # `project_id`, and symlinks back to the source `supabase/` directory so
-# migrations / seeds / schemas / functions / templates / tests all just work.
+# migrations / seeds / schemas / functions / tests all just work. Email
+# templates are copied instead (see sync_templates).
 #
 # The instance name is chosen in this order of precedence:
 #   1. $SUPABASE_WORKTREE_NAME           (explicit override)
@@ -15,7 +16,7 @@
 #
 set -euo pipefail
 
-VERSION="0.7.0"
+VERSION="0.7.1"
 
 # --- early dispatch for context-free subcommands -----------------------------
 # `version` / `--version` / `-v` must work without a project root so that
@@ -581,12 +582,49 @@ run_post_init_hook() {
     "$HOOK_FILE"
 }
 
+# sync_templates — copy supabase/templates into the instance dir; never link it.
+# The Supabase CLI resolves auth.email.*.content_path through symlinks and
+# refuses a path that lands outside the --workdir, so a templates symlink back
+# to ../../supabase/templates makes `start` fail. A copy keeps the path inside
+# the workdir. It is refreshed on every init / up, so template edits reach the
+# stack on the next `up`.
+sync_templates() {
+  local src="${ROOT}/supabase/templates"
+  local dst="${WT_SB_DIR}/templates"
+  [[ -d "$src" && -n "$WT_SB_DIR" ]] || return 0
+  # rm never follows a symlink given as its operand, so the link an older
+  # version created goes away without touching the templates it pointed at.
+  rm -rf "$dst"
+  cp -R "$src" "$dst"
+}
+
+# adapt_config_to_cli — rename config sections the installed CLI no longer reads.
+# Supabase CLI v3 refuses a config.toml that still has [inbucket] (or a
+# [remotes.<name>.inbucket] block); the same keys live under [local_smtp]. Only
+# the generated copy is rewritten, and only for a CLI that needs it: the source
+# config.toml stays readable by an older CLI, such as one CI pins from before
+# [local_smtp] existed.
+adapt_config_to_cli() {
+  [[ -f "$WT_CONFIG" ]] || return 0
+  local version major
+  version="$(supabase --version 2>/dev/null | head -n 1)" || return 0
+  major="${version#v}"
+  major="${major%%.*}"
+  if [[ ! "$major" =~ ^[0-9]+$ ]] || (( major < 3 )); then
+    return 0
+  fi
+  grep -Eq '^\[(remotes\.[^]]+\.)?inbucket\]' "$WT_CONFIG" || return 0
+  sed -E 's/^\[(remotes\.[^]]+\.)?inbucket\]/[\1local_smtp]/' "$WT_CONFIG" > "${WT_CONFIG}.tmp"
+  mv "${WT_CONFIG}.tmp" "$WT_CONFIG"
+  echo "supabase-worktree: renamed [inbucket] to [local_smtp] in ${WT_CONFIG} (Supabase CLI ${version})"
+}
+
 # --- subcommands -------------------------------------------------------------
 
 cmd_init() {
   mkdir -p "$WT_SB_DIR"
 
-  for d in migrations functions schemas seeds tests templates; do
+  for d in migrations functions schemas seeds tests; do
     src="${ROOT}/supabase/$d"
     dst="${WT_SB_DIR}/$d"
     if [[ -e "$src" && ! -e "$dst" ]]; then
@@ -594,11 +632,14 @@ cmd_init() {
     fi
   done
 
+  sync_templates
+
   write_wt_env
   write_root_env_local
 
   if [[ -f "$WT_CONFIG" ]]; then
     echo "supabase-worktree: config already present at $WT_CONFIG"
+    adapt_config_to_cli
     run_post_init_hook
     return 0
   fi
@@ -615,6 +656,7 @@ cmd_init() {
     -e "s|inspector_port = 8083|inspector_port = ${WT_INSPECTOR}|" \
     -e "s|127.0.0.1:54321|127.0.0.1:${WT_API}|g" \
     "$SOURCE_CONFIG" > "$WT_CONFIG"
+  adapt_config_to_cli
 
   echo "supabase-worktree: wrote ${WT_CONFIG}"
   echo "  project_id: ${PROJECT_ID}"

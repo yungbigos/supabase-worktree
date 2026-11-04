@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.7.1 — 2026-11-04
+
+- Fix: `up` failed on Supabase CLI 2.122+ with `StartInvalidConfigError … content_path … resolves outside the project root`. The CLI now resolves `auth.email.*.content_path` through symlinks and rejects a path outside the `--workdir`, and `templates/` was a symlink back to `../../supabase/templates`. `templates/` is now copied into `.supabase-worktree/supabase/` and refreshed on every `init` / `up`; an existing symlink from an older version is replaced on the next run. The other directories stay symlinked, since the CLI checks only the email-template paths.
+
 ## v0.6.0 — 2026-06-10
 
 - New committed config file: `$ROOT/.supabase-worktree.toml`. `offsets = [...]` replaces the built-in 50-slot pool (so a repo can reserve, say, 10 slots and whitelist 10 OAuth redirect URIs once); `[assignments]` pins worktree names to specific offsets. Unpinned names hash into the pool and linear-probe past slots pinned to other names, so a fresh worktree never lands on a reserved offset.

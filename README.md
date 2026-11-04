@@ -53,7 +53,8 @@ When you run `supabase-worktree init` (or `up`), the tool:
    4. `sha1(name)` over the reservable pool (50 slots — multiples of 100, `0..4900` — unless the config file or `$SUPABASE_WORKTREE_OFFSETS` shrinks it), linear-probing past slots pinned to other names. The offset is applied to all Supabase service ports (api, db, studio, inbucket, analytics, pooler, shadow, inspector). Because the slot set is finite and known up front, you can whitelist all derived OAuth redirect URIs once (`supabase-worktree ports`) and new worktrees never trigger a console roundtrip.
 3. **Detects the base `project_id`** from your `supabase/config.toml` and namespaces it: `${base}-${name}`.
 4. **Creates `.supabase-worktree/supabase/`** at the project root with:
-   - Symlinks back to `migrations/`, `functions/`, `schemas/`, `seeds/`, `tests/`, `templates/` — so editing those still touches the canonical source.
+   - Symlinks back to `migrations/`, `functions/`, `schemas/`, `seeds/`, `tests/` — so editing those still touches the canonical source.
+   - A copy of `templates/`, refreshed on every `init` / `up`. The Supabase CLI resolves email-template paths through symlinks and rejects any that lands outside the instance dir, so this one can't be a link.
    - A copied `config.toml` with rewritten ports and project_id.
 5. **Writes `.supabase-worktree/.env`** — a snapshot of `$ROOT/.env` (if present) plus per-instance overrides (`SUPABASE_URL`, `SITE_URL`, `SUPABASE_WORKTREE_NEXT_PORT`, etc.). The Supabase CLI reads this file when interpolating `env()` in `config.toml`, so OAuth `client_id`s and a per-worktree `site_url` resolve correctly. Regenerated on every `init` / `up`.
 6. **Generates `$ROOT/.env.local`** (only if missing — never clobbers your edits) with `NEXT_PUBLIC_SUPABASE_URL`, `SUPABASE_URL`, `SITE_URL`, `SUPABASE_WORKTREE_PORT_OFFSET`, and `SUPABASE_WORKTREE_NEXT_PORT`. Bun / Next / one-off scripts auto-load this and target the right stack with zero per-command flags.
@@ -260,6 +261,7 @@ This project uses [`supabase-worktree`](https://github.com/yungbigos/supabase-wo
 - **Port rewrite assumes Supabase defaults.** If you've customized ports in `supabase/config.toml`, the literal `port = 54321` replacements won't match. A TOML-aware rewrite is planned for v0.2.
 - **Port collisions are possible.** Two names can hash to the same slot; the chance grows with worktree count and shrinks the pool. Collisions only bite when both stacks run simultaneously — pin one of them in `.supabase-worktree.toml` `[assignments]` (or set `SUPABASE_WORKTREE_PORT_OFFSET`) to resolve. `status` shows your chosen ports and where the offset came from.
 - **`config.toml` is copied, not symlinked.** Edits to the source `config.toml` (e.g. enabling a new auth provider) won't propagate to existing isolated stacks. Delete `.supabase-worktree/supabase/config.toml` and re-run `init` to regenerate.
+- **`templates/` is a copy, not a symlink.** Edits to an email template reach a running stack only after the next `up` (which re-copies them) and a restart of the auth container.
 - **`.supabase-worktree/.env` is a snapshot, not a symlink.** Re-run `init` (or just `up`, which always refreshes the env) after editing the repo `.env` so the values reach the supabase CLI. The trade-off vs. a symlink is that per-instance overrides (`SITE_URL`, `SUPABASE_URL`) can live in the same file.
 
 ## License
