@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.7.3 — 2026-11-04
+
+- Fix: the error for a missing `supabase/` directory no longer suggests `SUPABASE_WORKTREE_NAME` as a way around it. That variable only renames the stack; the project root is still required. The message now says where it looked: the git top level, or the current folder and every folder above it.
+
 ## v0.7.2 — 2026-11-04
 
 - Fix: `up` failed on Supabase CLI 3 with `BadResource: FileSystem.access (…/supabase/functions/Dockerfile/index.ts)` when `supabase/functions` holds a top-level file named like a function, such as the `Dockerfile` at the root of a functions git submodule. CLI 3 `start` probes `<entry>/index.ts` for every such entry and aborts on a file. It also aborts with `failed to read file: …/<name>/index.ts` when `config.toml` declares `[functions.<name>]` with settings but the source has no `<name>/`. In either case `.supabase-worktree/supabase/functions` is now an rsync'd copy instead of a symlink: it leaves out those files and has a stub answering 501 for each missing function. The copy is re-synced on every `init` / `up`. Everything else keeps the symlink, and so does an older CLI. Links into the source can't stand in for the copy: the edge runtime loads a function from its real path, and one reached through a link fails with "Module not found".

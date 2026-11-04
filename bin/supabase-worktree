@@ -17,7 +17,7 @@
 #
 set -euo pipefail
 
-VERSION="0.7.2"
+VERSION="0.7.3"
 
 # --- early dispatch for context-free subcommands -----------------------------
 # `version` / `--version` / `-v` must work without a project root so that
@@ -106,8 +106,12 @@ EOF
       exit 0
       ;;
   esac
-  echo "supabase-worktree: no supabase/ directory found in this tree" >&2
-  echo "  (run inside a project that has a supabase/ folder, or set SUPABASE_WORKTREE_NAME to bypass)" >&2
+  if [[ -n "$ROOT" ]]; then
+    echo "supabase-worktree: no supabase/ directory at the git top level ${ROOT}" >&2
+  else
+    echo "supabase-worktree: no supabase/ directory in ${PWD} or any folder above it" >&2
+  fi
+  echo "  (run it from inside a project that has a supabase/ folder)" >&2
   exit 1
 fi
 
