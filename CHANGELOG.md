@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.7.4 — 2026-11-10
+
+- Fix: `restore` hands the `internal` schema and everything in it (functions, procedures, tables, sequences, views, types) back to `postgres`, as it already did for `public`, `cron` and `supabase_migrations`. A project that keeps server-only and trigger functions in `internal` was left with them owned by `supabase_admin`, so the next `CREATE OR REPLACE FUNCTION internal.…` migration, run as `postgres`, failed with "must be owner". Nothing changes for a project without an `internal` schema. Grants are still not restored (the restore runs with `--no-privileges`); re-apply them from the project.
+
 ## v0.7.3 — 2026-11-04
 
 - Fix: the error for a missing `supabase/` directory no longer suggests `SUPABASE_WORKTREE_NAME` as a way around it. That variable only renames the stack; the project root is still required. The message now says where it looked: the git top level, or the current folder and every folder above it.
