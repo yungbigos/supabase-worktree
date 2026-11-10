@@ -17,7 +17,7 @@
 #
 set -euo pipefail
 
-VERSION="0.7.3"
+VERSION="0.7.4"
 
 # --- early dispatch for context-free subcommands -----------------------------
 # `version` / `--version` / `-v` must work without a project root so that
@@ -1152,36 +1152,41 @@ EOF
   set -e
 
   echo ""
-  echo "==> Reassigning public.* ownership back to postgres (so 'supabase migration up' works)..."
+  echo "==> Reassigning public.* and internal.* ownership back to postgres (so 'supabase migration up' works)..."
   # The restore ran as supabase_admin (needed for auth/storage writes); flip
   # public-side objects back to the postgres role that migrations expect.
   psql "$admin_url" -v ON_ERROR_STOP=1 >/dev/null <<'SQL'
 DO $$
 DECLARE r record;
 BEGIN
+  -- A schema the dump created (internal, for server-only functions) belongs to
+  -- supabase_admin too; migrations run as postgres and must be able to create in it.
+  IF EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'internal') THEN
+    ALTER SCHEMA internal OWNER TO postgres;
+  END IF;
   FOR r IN
     SELECT format('ALTER TABLE %I.%I OWNER TO postgres', schemaname, tablename) AS cmd
-      FROM pg_tables WHERE schemaname IN ('public','cron','supabase_migrations')
+      FROM pg_tables WHERE schemaname IN ('public','internal','cron','supabase_migrations')
     UNION ALL
     SELECT format('ALTER SEQUENCE %I.%I OWNER TO postgres', sequence_schema, sequence_name)
-      FROM information_schema.sequences WHERE sequence_schema IN ('public','cron','supabase_migrations')
+      FROM information_schema.sequences WHERE sequence_schema IN ('public','internal','cron','supabase_migrations')
     UNION ALL
     SELECT format('ALTER VIEW %I.%I OWNER TO postgres', schemaname, viewname)
-      FROM pg_views WHERE schemaname IN ('public','cron','supabase_migrations')
+      FROM pg_views WHERE schemaname IN ('public','internal','cron','supabase_migrations')
     UNION ALL
     SELECT format('ALTER FUNCTION %I.%I(%s) OWNER TO postgres',
                   n.nspname, p.proname, pg_get_function_identity_arguments(p.oid))
       FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-      WHERE n.nspname IN ('public','cron','supabase_migrations') AND p.prokind = 'f'
+      WHERE n.nspname IN ('public','internal','cron','supabase_migrations') AND p.prokind = 'f'
     UNION ALL
     SELECT format('ALTER PROCEDURE %I.%I(%s) OWNER TO postgres',
                   n.nspname, p.proname, pg_get_function_identity_arguments(p.oid))
       FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-      WHERE n.nspname IN ('public','cron','supabase_migrations') AND p.prokind = 'p'
+      WHERE n.nspname IN ('public','internal','cron','supabase_migrations') AND p.prokind = 'p'
     UNION ALL
     SELECT format('ALTER TYPE %I.%I OWNER TO postgres', n.nspname, t.typname)
       FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
-      WHERE n.nspname = 'public' AND t.typtype IN ('e','c','d')
+      WHERE n.nspname IN ('public','internal') AND t.typtype IN ('e','c','d')
         AND NOT EXISTS (SELECT 1 FROM pg_class c WHERE c.reltype = t.oid)
   LOOP
     BEGIN
